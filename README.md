@@ -542,7 +542,7 @@ Every error uses one envelope:
 | HTTP | Code | When |
 |---|---|---|
 | 400 | `VALIDATION_ERROR` | Missing, blank, too long or invalid fields; invalid UUID; bad `page`/`page_size`; bad `Idempotency-Key` |
-| 400 | `INVALID_JSON` | Malformed JSON, empty body, unknown field, wrong type, multiple JSON values |
+| 400 | `INVALID_JSON` | Malformed JSON; empty or non-object body (including `null`); unknown, case-variant or duplicate field; wrong type; multiple JSON values |
 | 400 | `INVALID_STATUS` | Status value that is not one of the five statuses |
 | 404 | `TRIP_NOT_FOUND` | No trip with this ID |
 | 404 | `ROUTE_NOT_FOUND` | Unknown path |

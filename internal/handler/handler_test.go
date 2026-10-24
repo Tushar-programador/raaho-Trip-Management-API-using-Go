@@ -111,6 +111,12 @@ func TestCreateRejectsBadBodies(t *testing.T) {
 		{"client-supplied id", `{"id":"x","trip_number":"T","source":"A","destination":"B","driver_name":"C"}`, "application/json", 400, CodeInvalidJSON},
 		{"wrong type", `{"trip_number":123,"source":"A","destination":"B","driver_name":"C"}`, "application/json", 400, CodeInvalidJSON},
 		{"array body", `[]`, "application/json", 400, CodeInvalidJSON},
+		{"null body", `null`, "application/json", 400, CodeInvalidJSON},
+		{"string body", `"trip"`, "application/json", 400, CodeInvalidJSON},
+		{"whitespace body", " \n\t ", "application/json", 400, CodeInvalidJSON},
+		{"case-variant key", `{"Trip_Number":"T","source":"A","destination":"B","driver_name":"C"}`, "application/json", 400, CodeInvalidJSON},
+		{"duplicate key", `{"trip_number":"T","trip_number":"U","source":"A","destination":"B","driver_name":"C"}`, "application/json", 400, CodeInvalidJSON},
+		{"trailing garbage", `{"trip_number":"T","source":"A","destination":"B","driver_name":"C"} x`, "application/json", 400, CodeInvalidJSON},
 		{"two objects", `{"trip_number":"T"} {"trip_number":"U"}`, "application/json", 400, CodeInvalidJSON},
 		{"no content type", `{"trip_number":"T"}`, "", 415, CodeUnsupportedMediaType},
 		{"form content type", `trip_number=T`, "application/x-www-form-urlencoded", 415, CodeUnsupportedMediaType},
@@ -136,6 +142,45 @@ func TestCreateRejectsBadBodies(t *testing.T) {
 				t.Error("service must not be called for a rejected body")
 			}
 		})
+	}
+}
+
+func TestUpdateStatusRejectsAmbiguousBodies(t *testing.T) {
+	path := "/trips/" + uuid.NewString() + "/status"
+	for _, body := range []string{
+		`{"STATUS":"ASSIGNED"}`,                      // would otherwise match "status" case-insensitively
+		`{"status":"CANCELLED","Status":"ASSIGNED"}`, // last key would silently win
+		`{"status":"CANCELLED","status":"ASSIGNED"}`, // exact duplicate
+		`null`,
+	} {
+		svc := &fakeService{}
+		rec := do(t, newTestRouter(svc), http.MethodPatch, path, body, nil)
+		if rec.Code != http.StatusBadRequest || readError(t, rec).Code != CodeInvalidJSON {
+			t.Errorf("%s: %d %s, want 400 INVALID_JSON", body, rec.Code, rec.Body)
+		}
+		if svc.calls.Load() != 0 {
+			t.Errorf("%s: service must not be called", body)
+		}
+	}
+}
+
+func TestDecodeErrorMessages(t *testing.T) {
+	h := newTestRouter(&fakeService{})
+	cases := map[string]string{
+		`{"trip_number":"T","status":"X"}`:    `Request body contains unknown field "status"`,
+		`{"trip_number":"T","trip_number":1}`: `Request body contains duplicate field "trip_number"`,
+		`{"trip_number":1}`:                   `Field "trip_number" must be of type string`,
+		`null`:                                `Request body must be a JSON object`,
+		``:                                    `Request body must not be empty`,
+	}
+	for body, want := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/trips", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got := readError(t, rec).Message; got != want {
+			t.Errorf("%q: message %q, want %q", body, got, want)
+		}
 	}
 }
 
