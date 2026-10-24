@@ -15,6 +15,11 @@ var (
 	ErrIdempotencyKeyReused = errors.New("idempotency key reused with a different request")
 	// ErrUnavailable means a dependency (the database) cannot serve the request right now.
 	ErrUnavailable = errors.New("service temporarily unavailable")
+	// ErrUnauthenticated means the request has no API key, or one that is
+	// malformed, unknown or revoked. The cases are deliberately not distinguished.
+	ErrUnauthenticated = errors.New("missing or invalid API key")
+	// ErrClientNotFound means no API client exists with the requested ID.
+	ErrClientNotFound = errors.New("API client not found")
 )
 
 // TransitionError is returned when a status change violates the state machine.

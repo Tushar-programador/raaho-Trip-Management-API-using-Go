@@ -86,6 +86,19 @@ func TestFingerprint(t *testing.T) {
 	}
 }
 
+func TestValidateClientName(t *testing.T) {
+	for _, ok := range []string{"mobile-app", "Billing Service", strings.Repeat("é", MaxClientNameLength)} {
+		if err := ValidateClientName(ok); err != nil {
+			t.Errorf("ValidateClientName(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", strings.Repeat("a", MaxClientNameLength+1), "line\nbreak", "nul\x00"} {
+		if err := ValidateClientName(bad); err == nil {
+			t.Errorf("ValidateClientName(%q) accepted an invalid name", bad)
+		}
+	}
+}
+
 func TestValidateIdempotencyKey(t *testing.T) {
 	valid := []string{"a", "0192f3a4-5b6c-7d8e-9f01-23456789abcd", strings.Repeat("k", MaxIdempotencyKeyLength), "key_with.symbols~!"}
 	for _, k := range valid {

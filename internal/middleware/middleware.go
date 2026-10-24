@@ -79,6 +79,22 @@ func Recover(log *slog.Logger, onPanic http.HandlerFunc) func(http.Handler) http
 	}
 }
 
+// requestMeta collects facts discovered further down the chain (such as the
+// authenticated client) for the access log line written by Logger.
+type requestMeta struct {
+	clientID string
+}
+
+type metaKey struct{}
+
+// SetClientID records the authenticated client for the request's access log
+// line. It is a no-op outside Logger.
+func SetClientID(ctx context.Context, id string) {
+	if m, ok := ctx.Value(metaKey{}).(*requestMeta); ok {
+		m.clientID = id
+	}
+}
+
 // Logger writes one structured log line per request. Bodies, headers and
 // query strings are not logged, so no request data or secrets leak into logs.
 // Health-check probes are logged at debug level to keep the log readable.
@@ -86,6 +102,8 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
+			meta := &requestMeta{}
+			r = r.WithContext(context.WithValue(r.Context(), metaKey{}, meta))
 			ww := chimw.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
 
@@ -104,15 +122,19 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 			if rctx := chi.RouteContext(r.Context()); rctx != nil {
 				route = rctx.RoutePattern()
 			}
-			log.Log(r.Context(), level, "http request",
+			attrs := []any{
 				"request_id", RequestIDFromContext(r.Context()),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"route", route,
 				"status", status,
 				"bytes", ww.BytesWritten(),
-				"duration_ms", float64(time.Since(start).Microseconds())/1000,
-			)
+				"duration_ms", float64(time.Since(start).Microseconds()) / 1000,
+			}
+			if meta.clientID != "" {
+				attrs = append(attrs, "client_id", meta.clientID)
+			}
+			log.Log(r.Context(), level, "http request", attrs...)
 		})
 	}
 }
