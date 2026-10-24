@@ -14,7 +14,8 @@ DOCKER_TEST_APP_DATABASE_URL = postgres://trip_api:$(API_DB_PASSWORD)@postgres:5
 
 .DEFAULT_GOAL := help
 .PHONY: help run build test test-unit test-integration test-race test-race-docker \
-        lint fmt migrate-up migrate-down migrate-version db-up docker-up docker-down docker-logs clean
+        lint fmt migrate-up migrate-down migrate-version db-up docker-up docker-down docker-logs \
+        api-key api-keys clean
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -25,6 +26,7 @@ run: ## Run the API on the host (needs DATABASE_URL and a migrated database)
 build: ## Build bin/api and bin/migrate
 	CGO_ENABLED=0 $(GO) build -trimpath -o bin/api ./cmd/api
 	CGO_ENABLED=0 $(GO) build -trimpath -o bin/migrate ./cmd/migrate
+	CGO_ENABLED=0 $(GO) build -trimpath -o bin/apikey ./cmd/apikey
 
 test: ## Run all tests (integration tests are skipped unless TEST_DATABASE_URL is set)
 	$(GO) test ./...
@@ -70,6 +72,13 @@ docker-up: ## Build and start postgres -> migrate -> api, waiting for health che
 
 docker-down: ## Stop the stack (keeps the database volume)
 	$(COMPOSE) down
+
+api-key: ## Create an API key in the compose database: make api-key NAME=my-client
+	@test -n "$(NAME)" || (echo "usage: make api-key NAME=my-client" && exit 1)
+	$(COMPOSE) run --rm -T --no-deps --entrypoint /app/apikey migrate create "$(NAME)"
+
+api-keys: ## List API clients in the compose database
+	$(COMPOSE) run --rm -T --no-deps --entrypoint /app/apikey migrate list
 
 docker-logs: ## Follow API logs
 	$(COMPOSE) logs -f api
