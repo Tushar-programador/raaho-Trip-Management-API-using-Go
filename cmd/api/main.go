@@ -79,7 +79,7 @@ func run() error {
 	svc := service.NewTripService(repository.NewTripRepository(pool), cfg.IdempotencyTTL)
 	srv := &http.Server{
 		Addr: cfg.HTTPAddr,
-		Handler: handler.NewRouter(svc, log, handler.RouterOptions{
+		Handler: handler.NewRouter(svc, repository.NewClientRepository(pool), log, handler.RouterOptions{
 			RequestTimeout: cfg.RequestTimeout,
 			MaxBodyBytes:   cfg.MaxBodyBytes,
 			Draining:       &draining,

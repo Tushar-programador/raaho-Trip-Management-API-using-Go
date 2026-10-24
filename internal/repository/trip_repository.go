@@ -76,16 +76,16 @@ func (r *TripRepository) Create(ctx context.Context, trip domain.Trip, key *doma
 //     and therefore sees the row the blocking transaction just committed.
 func claimIdempotencyKey(ctx context.Context, tx pgx.Tx, key *domain.IdempotencyKey) (domain.Trip, bool, error) {
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO idempotency_keys (scope, idempotency_key, request_hash, created_at, expires_at)
-		VALUES ($1, $2, $3, now(), now() + make_interval(secs => $4))
-		ON CONFLICT (scope, idempotency_key) DO UPDATE
+		INSERT INTO idempotency_keys (client_id, scope, idempotency_key, request_hash, created_at, expires_at)
+		VALUES ($1, $2, $3, $4, now(), now() + make_interval(secs => $5))
+		ON CONFLICT (client_id, scope, idempotency_key) DO UPDATE
 		   SET request_hash  = EXCLUDED.request_hash,
 		       trip_id       = NULL,
 		       trip_snapshot = NULL,
 		       created_at    = EXCLUDED.created_at,
 		       expires_at    = EXCLUDED.expires_at
 		 WHERE idempotency_keys.expires_at <= now()`,
-		key.Scope, key.Key, key.RequestHash, key.TTL.Seconds())
+		key.ClientID, key.Scope, key.Key, key.RequestHash, key.TTL.Seconds())
 	if err != nil {
 		return domain.Trip{}, false, fmt.Errorf("claim idempotency key: %w", err)
 	}
@@ -98,8 +98,8 @@ func claimIdempotencyKey(ctx context.Context, tx pgx.Tx, key *domain.Idempotency
 	err = tx.QueryRow(ctx, `
 		SELECT request_hash, trip_snapshot
 		  FROM idempotency_keys
-		 WHERE scope = $1 AND idempotency_key = $2`,
-		key.Scope, key.Key).Scan(&storedHash, &snapshot)
+		 WHERE client_id = $1 AND scope = $2 AND idempotency_key = $3`,
+		key.ClientID, key.Scope, key.Key).Scan(&storedHash, &snapshot)
 	if err != nil {
 		return domain.Trip{}, false, fmt.Errorf("read idempotency key: %w", err)
 	}
@@ -126,9 +126,9 @@ func completeIdempotencyKey(ctx context.Context, tx pgx.Tx, key *domain.Idempote
 	}
 	_, err = tx.Exec(ctx, `
 		UPDATE idempotency_keys
-		   SET trip_id = $3, trip_snapshot = $4
-		 WHERE scope = $1 AND idempotency_key = $2`,
-		key.Scope, key.Key, trip.ID, snapshot)
+		   SET trip_id = $4, trip_snapshot = $5
+		 WHERE client_id = $1 AND scope = $2 AND idempotency_key = $3`,
+		key.ClientID, key.Scope, key.Key, trip.ID, snapshot)
 	if err != nil {
 		return fmt.Errorf("complete idempotency key: %w", err)
 	}

@@ -31,9 +31,10 @@ type CreateResult struct {
 	Replayed bool // true when an earlier result was returned for the same Idempotency-Key
 }
 
-// Create validates the input and stores a new trip in status CREATED.
-// idempotencyKey is optional; pass "" when the client did not send one.
-func (s *TripService) Create(ctx context.Context, in domain.CreateTripInput, idempotencyKey string) (CreateResult, error) {
+// Create validates the input and stores a new trip in status CREATED on
+// behalf of clientID. idempotencyKey is optional; pass "" when the client did
+// not send one.
+func (s *TripService) Create(ctx context.Context, clientID uuid.UUID, in domain.CreateTripInput, idempotencyKey string) (CreateResult, error) {
 	in = in.Normalize()
 	if err := in.Validate(); err != nil {
 		return CreateResult{}, err
@@ -45,6 +46,7 @@ func (s *TripService) Create(ctx context.Context, in domain.CreateTripInput, ide
 			return CreateResult{}, err
 		}
 		key = &domain.IdempotencyKey{
+			ClientID:    clientID,
 			Scope:       domain.IdempotencyScopeCreateTrip,
 			Key:         idempotencyKey,
 			RequestHash: in.Fingerprint(),

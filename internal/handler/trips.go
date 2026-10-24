@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/Tushar-programador/trip-management-api/internal/auth"
 	"github.com/Tushar-programador/trip-management-api/internal/domain"
 	"github.com/Tushar-programador/trip-management-api/internal/service"
 )
@@ -20,7 +21,7 @@ const IdempotencyKeyHeader = "Idempotency-Key"
 // TripService is the behaviour the handlers need. It is declared here, at the
 // consumer, so handler tests can supply a fake without a database.
 type TripService interface {
-	Create(ctx context.Context, in domain.CreateTripInput, idempotencyKey string) (service.CreateResult, error)
+	Create(ctx context.Context, clientID uuid.UUID, in domain.CreateTripInput, idempotencyKey string) (service.CreateResult, error)
 	Get(ctx context.Context, id uuid.UUID) (domain.Trip, error)
 	List(ctx context.Context, f domain.ListFilter) (domain.TripPage, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status string) (domain.Trip, error)
@@ -58,7 +59,13 @@ func (h *TripHandler) create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := h.svc.Create(r.Context(), in, key)
+	// The /trips routes are behind auth.Middleware, so a client is present.
+	client, ok := auth.ClientFromContext(r.Context())
+	if !ok {
+		writeError(w, r, h.log, domain.ErrUnauthenticated)
+		return
+	}
+	res, err := h.svc.Create(r.Context(), client.ID, in, key)
 	if err != nil {
 		writeError(w, r, h.log, err)
 		return

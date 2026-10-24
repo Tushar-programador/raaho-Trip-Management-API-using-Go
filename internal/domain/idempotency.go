@@ -5,18 +5,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // MaxIdempotencyKeyLength matches idempotency_keys.idempotency_key VARCHAR(255).
 const MaxIdempotencyKeyLength = 255
 
-// IdempotencyScopeCreateTrip namespaces keys used on POST /trips. With
-// authentication this would also include the client/tenant identity.
+// IdempotencyScopeCreateTrip namespaces keys used on POST /trips.
 const IdempotencyScopeCreateTrip = "POST /trips"
 
 // IdempotencyKey is a client-supplied key bound to the fingerprint of the
-// request it was first used with.
+// request it was first used with. Keys are unique per (client, scope), so
+// clients can neither collide on a key nor read each other's results.
 type IdempotencyKey struct {
+	ClientID    uuid.UUID
 	Scope       string
 	Key         string
 	RequestHash string

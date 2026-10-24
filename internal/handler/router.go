@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Tushar-programador/trip-management-api/api"
+	"github.com/Tushar-programador/trip-management-api/internal/auth"
 	"github.com/Tushar-programador/trip-management-api/internal/middleware"
 )
 
@@ -22,8 +23,9 @@ type RouterOptions struct {
 	Draining *atomic.Bool
 }
 
-// NewRouter wires middleware and routes.
-func NewRouter(svc TripService, log *slog.Logger, opts RouterOptions) http.Handler {
+// NewRouter wires middleware and routes. Every /trips route requires an API
+// key resolved through clients; health checks and the OpenAPI document do not.
+func NewRouter(svc TripService, clients auth.ClientStore, log *slog.Logger, opts RouterOptions) http.Handler {
 	h := &TripHandler{svc: svc, log: log}
 	r := chi.NewRouter()
 
@@ -66,6 +68,9 @@ func NewRouter(svc TripService, log *slog.Logger, opts RouterOptions) http.Handl
 	})
 
 	r.Route("/trips", func(r chi.Router) {
+		r.Use(auth.Middleware(clients, func(w http.ResponseWriter, r *http.Request, err error) {
+			writeError(w, r, log, err)
+		}))
 		r.Post("/", h.create)
 		r.Get("/", h.list)
 		r.Get("/{id}", h.get)

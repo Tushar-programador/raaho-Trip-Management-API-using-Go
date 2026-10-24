@@ -26,8 +26,10 @@ import (
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Tushar-programador/trip-management-api/internal/auth"
 	"github.com/Tushar-programador/trip-management-api/internal/domain"
 	"github.com/Tushar-programador/trip-management-api/internal/handler"
 	"github.com/Tushar-programador/trip-management-api/internal/platform/database"
@@ -42,6 +44,7 @@ var (
 	pool    *pgxpool.Pool // owner role: truncation and direct assertions
 	appPool *pgxpool.Pool // the API's connection; nil when TEST_APP_DATABASE_URL is unset
 	baseURL string        // the API under test
+	apiKey  string        // key of the default API client; send() uses it
 	client  = &http.Client{Timeout: 30 * time.Second}
 )
 
@@ -94,8 +97,19 @@ func runWithDatabase(m *testing.M, url string) int {
 		fmt.Println("TEST_APP_DATABASE_URL not set: the API under test connects as the owner role")
 	}
 
+	// Start every run with no API clients (cascading to idempotency keys) and
+	// one default client whose key send() uses.
+	if _, err := pool.Exec(ctx, `TRUNCATE api_clients CASCADE`); err != nil {
+		fmt.Fprintln(os.Stderr, "reset api_clients:", err)
+		return 1
+	}
+	if _, apiKey, err = createClient(ctx, "integration-tests"); err != nil {
+		fmt.Fprintln(os.Stderr, "create API client:", err)
+		return 1
+	}
+
 	svc := service.NewTripService(repository.NewTripRepository(apiPool), time.Hour)
-	srv := httptest.NewServer(handler.NewRouter(svc, log, handler.RouterOptions{
+	srv := httptest.NewServer(handler.NewRouter(svc, repository.NewClientRepository(apiPool), log, handler.RouterOptions{
 		RequestTimeout: 20 * time.Second,
 		MaxBodyBytes:   64 << 10,
 	}))
@@ -103,6 +117,21 @@ func runWithDatabase(m *testing.M, url string) int {
 	baseURL = srv.URL
 
 	return m.Run()
+}
+
+// createClient registers an API client (as the owner, like cmd/apikey) and
+// returns it with its plaintext key.
+func createClient(ctx context.Context, name string) (domain.Client, string, error) {
+	key, err := auth.NewKey()
+	if err != nil {
+		return domain.Client{}, "", err
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return domain.Client{}, "", err
+	}
+	c, err := repository.NewClientRepository(pool).Create(ctx, id, name, auth.DisplayPrefix(key), auth.HashKey(key))
+	return c, key, err
 }
 
 func migrateUp(ctx context.Context, url string, log *slog.Logger) error {
@@ -188,8 +217,10 @@ func (r response) list(t *testing.T) listBody {
 	return lb
 }
 
-// send performs a request. It is safe to call from multiple goroutines; it
-// reports failures with t.Errorf so it never calls FailNow off the test goroutine.
+// send performs a request authenticated with the default client's API key.
+// Pass an "Authorization" header to override it, or set it to "" to send no
+// credentials. It is safe to call from multiple goroutines; it reports
+// failures with t.Errorf so it never calls FailNow off the test goroutine.
 func send(t *testing.T, method, path string, body any, headers map[string]string) response {
 	t.Helper()
 	var rdr io.Reader
@@ -213,8 +244,16 @@ func send(t *testing.T, method, path string, body any, headers map[string]string
 	if rdr != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	authorization := "Bearer " + apiKey
 	for k, v := range headers {
+		if k == "Authorization" {
+			authorization = v
+			continue
+		}
 		req.Header.Set(k, v)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

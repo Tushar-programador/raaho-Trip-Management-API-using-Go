@@ -13,6 +13,7 @@ import (
 // Stable, machine-readable error codes. Clients should branch on these, not
 // on messages.
 const (
+	CodeUnauthenticated         = "UNAUTHENTICATED"
 	CodeValidation              = "VALIDATION_ERROR"
 	CodeInvalidJSON             = "INVALID_JSON"
 	CodeUnsupportedMediaType    = "UNSUPPORTED_MEDIA_TYPE"
@@ -72,6 +73,8 @@ func mapError(err error) (int, errorDetail) {
 		return http.StatusBadRequest, errorDetail{Code: CodeInvalidStatus, Message: statusErr.Error()}
 	case errors.As(err, &transitionErr):
 		return http.StatusConflict, errorDetail{Code: CodeInvalidStatusTransition, Message: transitionErr.Error()}
+	case errors.Is(err, domain.ErrUnauthenticated):
+		return http.StatusUnauthorized, errorDetail{Code: CodeUnauthenticated, Message: "A valid API key is required (Authorization: Bearer <key>)"}
 	case errors.Is(err, domain.ErrTripNotFound):
 		return http.StatusNotFound, errorDetail{Code: CodeTripNotFound, Message: "Trip not found"}
 	case errors.Is(err, domain.ErrTripNumberExists):
@@ -98,6 +101,9 @@ func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err er
 
 	status, detail := mapError(err)
 	detail.RequestID = middleware.RequestIDFromContext(r.Context())
+	if status == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="trip-management-api"`)
+	}
 	if status >= 500 {
 		log.ErrorContext(r.Context(), "request failed", "request_id", detail.RequestID, "status", status, "error", err)
 	}

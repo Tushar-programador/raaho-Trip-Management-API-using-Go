@@ -18,12 +18,20 @@ info:
     Status changes are validated against the persisted status while the trip
     row is locked, so concurrent updates cannot bypass the rules.
 
+    **Authentication:** every `/trips` operation requires an API key sent as
+    `Authorization: Bearer tma_...`. Keys are issued and revoked by operators
+    with the `apikey` command. A missing, malformed, unknown or revoked key
+    returns `401 UNAUTHENTICATED`. Health checks and this document are public.
+
     All error responses use the `ErrorResponse` envelope. Every response carries
     an `X-Request-ID` header; send your own (1-128 chars of `[A-Za-z0-9._-]`) to
     correlate requests across services.
 servers:
   - url: http://localhost:8080
     description: Local development
+
+security:
+  - ApiKey: []
 
 tags:
   - name: Trips
@@ -45,6 +53,8 @@ paths:
         `Idempotent-Replayed: true`) without creating another trip; repeating it
         with a different body returns `409 IDEMPOTENCY_KEY_REUSED`. Only
         successful creations are remembered, for `IDEMPOTENCY_TTL` (default 24h).
+        Keys are scoped to the authenticated client, so two clients may use the
+        same key independently.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -99,6 +109,8 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -134,6 +146,8 @@ paths:
                 $ref: '#/components/schemas/TripList'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -157,6 +171,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/TripNotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -175,6 +191,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/TripNotFound'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -225,6 +243,8 @@ paths:
           $ref: '#/components/responses/PayloadTooLarge'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -234,6 +254,7 @@ paths:
     get:
       tags: [Operations]
       operationId: liveness
+      security: []
       summary: Liveness probe (process is running; does not check the database)
       responses:
         '200':
@@ -248,6 +269,7 @@ paths:
     get:
       tags: [Operations]
       operationId: readiness
+      security: []
       summary: Readiness probe (database reachable and not shutting down)
       responses:
         '200':
@@ -264,6 +286,7 @@ paths:
     get:
       tags: [Operations]
       operationId: openapi
+      security: []
       summary: This OpenAPI document
       responses:
         '200':
@@ -272,6 +295,13 @@ paths:
             application/yaml: {}
 
 components:
+  securitySchemes:
+    ApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: API key (tma_ followed by 43 base64url characters)
+      description: Issued with `apikey create NAME`; only its SHA-256 hash is stored server-side.
+
   parameters:
     TripID:
       name: id
@@ -283,7 +313,7 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      description: 1-255 printable ASCII characters without spaces (a UUID is recommended)
+      description: 1-255 printable ASCII characters without spaces (a UUID is recommended); scoped to the authenticated client
       schema: { type: string, minLength: 1, maxLength: 255, pattern: '^[!-~]+$' }
 
   headers:
@@ -363,6 +393,7 @@ components:
             code:
               type: string
               enum:
+                - UNAUTHENTICATED
                 - VALIDATION_ERROR
                 - INVALID_JSON
                 - INVALID_STATUS
@@ -419,6 +450,20 @@ components:
                   code: INVALID_STATUS
                   message: 'invalid status "DONE": must be one of CREATED, ASSIGNED, IN_TRANSIT, COMPLETED, CANCELLED'
                   request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+    Unauthenticated:
+      description: Missing, malformed, unknown or revoked API key
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, example: 'Bearer realm="trip-management-api"' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNAUTHENTICATED
+              message: 'A valid API key is required (Authorization: Bearer <key>)'
+              request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
     TripNotFound:
       description: No trip with this ID
       content:

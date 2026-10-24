@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Tushar-programador/trip-management-api/internal/auth"
 	"github.com/Tushar-programador/trip-management-api/internal/domain"
 	"github.com/Tushar-programador/trip-management-api/internal/service"
 )
@@ -27,6 +28,7 @@ type fakeService struct {
 	created    domain.Trip
 	replayed   bool
 	gotKey     string
+	gotClient  uuid.UUID
 	gotInput   domain.CreateTripInput
 	getErr     error
 	panicOnGet bool
@@ -34,9 +36,9 @@ type fakeService struct {
 	calls      atomic.Int32
 }
 
-func (f *fakeService) Create(_ context.Context, in domain.CreateTripInput, key string) (service.CreateResult, error) {
+func (f *fakeService) Create(_ context.Context, clientID uuid.UUID, in domain.CreateTripInput, key string) (service.CreateResult, error) {
 	f.calls.Add(1)
-	f.gotInput, f.gotKey = in, key
+	f.gotClient, f.gotInput, f.gotKey = clientID, in, key
 	return service.CreateResult{Trip: f.created, Replayed: f.replayed}, f.createErr
 }
 
@@ -65,14 +67,48 @@ func (f *fakeService) Delete(context.Context, uuid.UUID) error {
 
 func (f *fakeService) Ready(context.Context) error { return f.readyErr }
 
+// testKey is the API key accepted by fakeClients; newRequest sends it.
+var (
+	testKey    = mustNewKey()
+	testClient = domain.Client{ID: uuid.MustParse("0192f3a4-5b6c-7d8e-9f01-23456789abcd"), Name: "handler-tests"}
+)
+
+func mustNewKey() string {
+	key, err := auth.NewKey()
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+// fakeClients authenticates testKey only, or fails every lookup with err.
+type fakeClients struct{ err error }
+
+func (f fakeClients) FindActiveByKeyHash(_ context.Context, keyHash string) (domain.Client, error) {
+	if f.err != nil {
+		return domain.Client{}, f.err
+	}
+	if keyHash == auth.HashKey(testKey) {
+		return testClient, nil
+	}
+	return domain.Client{}, domain.ErrUnauthenticated
+}
+
 func newTestRouter(svc TripService) http.Handler {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewRouter(svc, log, RouterOptions{RequestTimeout: 5 * time.Second, MaxBodyBytes: 1024})
+	return NewRouter(svc, fakeClients{}, log, RouterOptions{RequestTimeout: 5 * time.Second, MaxBodyBytes: 1024})
+}
+
+// newRequest builds a request authenticated with testKey.
+func newRequest(method, path string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, path, body)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	return req
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req := newRequest(method, path, strings.NewReader(body))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -125,7 +161,7 @@ func TestCreateRejectsBadBodies(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			svc := &fakeService{}
-			req := httptest.NewRequest(http.MethodPost, "/trips", strings.NewReader(c.body))
+			req := newRequest(http.MethodPost, "/trips", strings.NewReader(c.body))
 			if c.contentType != "" {
 				req.Header.Set("Content-Type", c.contentType)
 			}
@@ -174,7 +210,7 @@ func TestDecodeErrorMessages(t *testing.T) {
 		``:                                    `Request body must not be empty`,
 	}
 	for body, want := range cases {
-		req := httptest.NewRequest(http.MethodPost, "/trips", strings.NewReader(body))
+		req := newRequest(http.MethodPost, "/trips", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -196,6 +232,9 @@ func TestCreateSuccessAndReplayHeaders(t *testing.T) {
 	if svc.gotKey != "abc-123" {
 		t.Errorf("idempotency key passed to service = %q", svc.gotKey)
 	}
+	if svc.gotClient != testClient.ID {
+		t.Errorf("client passed to service = %s, want the authenticated client %s", svc.gotClient, testClient.ID)
+	}
 	if rec.Header().Get("Location") != "/trips/"+trip.ID.String() {
 		t.Errorf("Location = %q", rec.Header().Get("Location"))
 	}
@@ -210,7 +249,7 @@ func TestCreateSuccessAndReplayHeaders(t *testing.T) {
 
 func TestCreateRejectsEmptyIdempotencyKeyHeader(t *testing.T) {
 	svc := &fakeService{}
-	req := httptest.NewRequest(http.MethodPost, "/trips", strings.NewReader(`{"trip_number":"T","source":"A","destination":"B","driver_name":"C"}`))
+	req := newRequest(http.MethodPost, "/trips", strings.NewReader(`{"trip_number":"T","source":"A","destination":"B","driver_name":"C"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header["Idempotency-Key"] = []string{""}
 	rec := httptest.NewRecorder()
@@ -294,7 +333,7 @@ func TestReadiness(t *testing.T) {
 	svc := &fakeService{}
 	var draining atomic.Bool
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := NewRouter(svc, log, RouterOptions{RequestTimeout: time.Second, MaxBodyBytes: 1024, Draining: &draining})
+	h := NewRouter(svc, fakeClients{}, log, RouterOptions{RequestTimeout: time.Second, MaxBodyBytes: 1024, Draining: &draining})
 
 	if rec := do(t, h, http.MethodGet, "/readyz", "", nil); rec.Code != 200 {
 		t.Errorf("ready: %d", rec.Code)
@@ -331,12 +370,12 @@ func (l *levelRecorder) WithGroup(string) slog.Handler      { return l }
 func TestClientDisconnectIsNotAServerError(t *testing.T) {
 	rec := &levelRecorder{}
 	rec.max.Store(int64(slog.LevelDebug))
-	h := NewRouter(&fakeService{getErr: fmt.Errorf("query: %w", context.Canceled)}, slog.New(rec),
+	h := NewRouter(&fakeService{getErr: fmt.Errorf("query: %w", context.Canceled)}, fakeClients{}, slog.New(rec),
 		RouterOptions{RequestTimeout: 5 * time.Second, MaxBodyBytes: 1024})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the client has already gone away
-	req := httptest.NewRequest(http.MethodGet, "/trips/"+uuid.NewString(), nil).WithContext(ctx)
+	req := newRequest(http.MethodGet, "/trips/"+uuid.NewString(), nil).WithContext(ctx)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
@@ -372,5 +411,67 @@ func TestMapError(t *testing.T) {
 		if status == 500 && strings.Contains(detail.Message, "SQLSTATE") {
 			t.Errorf("internal error leaked: %q", detail.Message)
 		}
+	}
+}
+
+func TestTripRoutesRequireAPIKey(t *testing.T) {
+	routes := []struct{ method, path, body string }{
+		{http.MethodPost, "/trips", `{"trip_number":"T","source":"A","destination":"B","driver_name":"C"}`},
+		{http.MethodGet, "/trips", ""},
+		{http.MethodGet, "/trips/" + uuid.NewString(), ""},
+		{http.MethodPatch, "/trips/" + uuid.NewString() + "/status", `{"status":"ASSIGNED"}`},
+		{http.MethodDelete, "/trips/" + uuid.NewString(), ""},
+		{http.MethodGet, "/trips/not-a-uuid", ""}, // authentication comes before input validation
+	}
+	otherKey := mustNewKey()
+	headers := map[string]string{
+		"missing":       "",
+		"wrong scheme":  "Basic " + testKey,
+		"malformed key": "Bearer not-a-key",
+		"unknown key":   "Bearer " + otherKey,
+	}
+	for _, rt := range routes {
+		for name, header := range headers {
+			svc := &fakeService{}
+			req := httptest.NewRequest(rt.method, rt.path, strings.NewReader(rt.body))
+			req.Header.Set("Content-Type", "application/json")
+			if header != "" {
+				req.Header.Set("Authorization", header)
+			}
+			rec := httptest.NewRecorder()
+			newTestRouter(svc).ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized || readError(t, rec).Code != CodeUnauthenticated {
+				t.Errorf("%s %s (%s): %d %s, want 401 UNAUTHENTICATED", rt.method, rt.path, name, rec.Code, rec.Body)
+			}
+			if rec.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("%s %s (%s): missing WWW-Authenticate header", rt.method, rt.path, name)
+			}
+			if svc.calls.Load() != 0 {
+				t.Errorf("%s %s (%s): service called without authentication", rt.method, rt.path, name)
+			}
+		}
+	}
+}
+
+func TestOperationalEndpointsNeedNoAPIKey(t *testing.T) {
+	h := newTestRouter(&fakeService{})
+	for _, path := range []string{"/healthz", "/readyz", "/openapi.yaml"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s without a key: %d", path, rec.Code)
+		}
+	}
+}
+
+func TestAuthLookupFailureIsServiceUnavailable(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewRouter(&fakeService{}, fakeClients{err: fmt.Errorf("%w: connection refused", domain.ErrUnavailable)}, log,
+		RouterOptions{RequestTimeout: time.Second, MaxBodyBytes: 1024})
+	rec := do(t, h, http.MethodGet, "/trips", "", nil)
+	// A database outage must not be reported as "your key is invalid".
+	if rec.Code != http.StatusServiceUnavailable || readError(t, rec).Code != CodeServiceUnavailable {
+		t.Errorf("%d %s, want 503", rec.Code, rec.Body)
 	}
 }
