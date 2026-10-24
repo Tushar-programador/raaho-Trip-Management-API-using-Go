@@ -24,6 +24,7 @@ type Config struct {
 	IdleTimeout        time.Duration
 	RequestTimeout     time.Duration
 	ShutdownTimeout    time.Duration
+	ShutdownDrainDelay time.Duration
 	MaxBodyBytes       int64
 	DBMaxConns         int32
 	DBConnectTimeout   time.Duration
@@ -52,6 +53,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		IdleTimeout:        p.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 		RequestTimeout:     p.duration("REQUEST_TIMEOUT", 10*time.Second),
 		ShutdownTimeout:    p.duration("SHUTDOWN_TIMEOUT", 20*time.Second),
+		ShutdownDrainDelay: p.duration("SHUTDOWN_DRAIN_DELAY", 0),
 		MaxBodyBytes:       p.int64("MAX_BODY_BYTES", 64<<10),
 		DBMaxConns:         int32(p.int64("DB_MAX_CONNS", 10)),
 		DBConnectTimeout:   p.duration("DB_CONNECT_TIMEOUT", 30*time.Second),
@@ -93,6 +95,10 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	}
 	if cfg.DBLockTimeout > cfg.DBStatementTimeout {
 		p.fail("DB_LOCK_TIMEOUT must not exceed DB_STATEMENT_TIMEOUT")
+	}
+	// Zero disables the delay; it must leave time to finish in-flight requests.
+	if cfg.ShutdownDrainDelay < 0 || cfg.ShutdownDrainDelay >= cfg.ShutdownTimeout {
+		p.fail("SHUTDOWN_DRAIN_DELAY must be at least 0 and less than SHUTDOWN_TIMEOUT")
 	}
 	if cfg.MaxBodyBytes < 1024 {
 		p.fail("MAX_BODY_BYTES must be at least 1024")

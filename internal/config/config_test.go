@@ -50,6 +50,23 @@ func TestDatabaseTimeoutsMustNest(t *testing.T) {
 	}
 }
 
+func TestShutdownDrainDelay(t *testing.T) {
+	base := func(delay string) map[string]string {
+		return map[string]string{"DATABASE_URL": "postgres://localhost/db", "SHUTDOWN_TIMEOUT": "10s", "SHUTDOWN_DRAIN_DELAY": delay}
+	}
+	if cfg, err := LoadFrom(env(base("5s"))); err != nil || cfg.ShutdownDrainDelay != 5*time.Second {
+		t.Errorf("5s drain delay: %v, %v", cfg.ShutdownDrainDelay, err)
+	}
+	if cfg, err := LoadFrom(env(base("0s"))); err != nil || cfg.ShutdownDrainDelay != 0 {
+		t.Errorf("drain delay 0 must be allowed: %v", err)
+	}
+	for _, bad := range []string{"10s", "-1s"} {
+		if _, err := LoadFrom(env(base(bad))); err == nil || !strings.Contains(err.Error(), "SHUTDOWN_DRAIN_DELAY") {
+			t.Errorf("drain delay %s: expected error, got %v", bad, err)
+		}
+	}
+}
+
 func TestRequestTimeoutMustBeBelowWriteTimeout(t *testing.T) {
 	_, err := LoadFrom(env(map[string]string{
 		"DATABASE_URL":       "postgres://localhost/db",

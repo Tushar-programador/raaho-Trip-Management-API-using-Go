@@ -579,6 +579,7 @@ All configuration comes from environment variables. The values are validated at 
 | `HTTP_IDLE_TIMEOUT` | `60s` | Keep-alive idle timeout |
 | `REQUEST_TIMEOUT` | `10s` | Context deadline for handlers and their DB queries; must be less than `HTTP_WRITE_TIMEOUT` |
 | `SHUTDOWN_TIMEOUT` | `20s` | Grace period for in-flight requests on SIGINT/SIGTERM |
+| `SHUTDOWN_DRAIN_DELAY` | `0s` | Time to keep serving with `/readyz` failing before closing the listener, so load balancers can deregister the instance (e.g. `5s`); counts toward and must be less than `SHUTDOWN_TIMEOUT` |
 | `MAX_BODY_BYTES` | `65536` | Request body limit (`413` above it) |
 | `DB_MAX_CONNS` | `10` | Connection pool size |
 | `DB_CONNECT_TIMEOUT` | `30s` | How long startup retries reaching the database before failing |
@@ -703,7 +704,13 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 - **Log hygiene:** access logs record method, path, route, status, size and duration. They never record bodies, headers or query strings, so no personal data or secrets end up in logs. `DATABASE_URL` parse errors are not echoed, because they could contain the password. Inbound `X-Request-ID` values are restricted to `[A-Za-z0-9._-]{1,128}` to prevent header and log injection.
 - **Container:** distroless, non-root, static binary, no shell. Credentials come only from the environment; nothing is baked into the image.
 - **Health:** `/healthz` (liveness) never touches the database, so a DB outage does not trigger restart loops. `/readyz` checks the database and returns `503` while draining. Startup fails loudly on bad config, an unreachable DB (after `DB_CONNECT_TIMEOUT`), or an outdated schema.
-- **Graceful shutdown:** on SIGTERM, readiness turns to `503`, in-flight requests finish within `SHUTDOWN_TIMEOUT`, then the pool closes.
+- **Graceful shutdown:** on SIGTERM:
+  1. Readiness turns to `503`.
+  2. The server keeps serving for `SHUTDOWN_DRAIN_DELAY`, so load balancers can stop routing to it.
+  3. In-flight requests finish within `SHUTDOWN_TIMEOUT`.
+  4. The pool closes.
+
+  A second signal exits immediately.
 - **Dependency outages:** the following all map to a retryable `503 SERVICE_UNAVAILABLE`, and the service recovers automatically:
   - connection failures;
   - connections lost mid-query (restart, failover, dropped socket);

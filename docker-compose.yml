@@ -57,6 +57,9 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+    # Longer than SHUTDOWN_TIMEOUT (which includes the drain delay), so Docker does not
+    # SIGKILL the API while it is still draining.
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

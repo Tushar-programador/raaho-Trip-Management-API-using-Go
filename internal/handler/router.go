@@ -16,8 +16,9 @@ import (
 type RouterOptions struct {
 	RequestTimeout time.Duration
 	MaxBodyBytes   int64
-	// Draining, when set to true during shutdown, makes /readyz fail so load
-	// balancers stop routing new traffic while in-flight requests finish.
+	// Draining is set at the start of shutdown. /readyz then fails while the
+	// server keeps serving for SHUTDOWN_DRAIN_DELAY, giving load balancers time
+	// to stop routing here before the listener closes.
 	Draining *atomic.Bool
 }
 

@@ -98,10 +98,18 @@ func run() error {
 	case <-ctx.Done():
 	}
 
-	log.Info("shutdown signal received, draining", "timeout", cfg.ShutdownTimeout.String())
-	draining.Store(true)
+	stop() // a second signal now terminates immediately
+	log.Info("shutdown signal received, draining",
+		"drain_delay", cfg.ShutdownDrainDelay.String(), "timeout", cfg.ShutdownTimeout.String())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
+
+	// Fail readiness first and keep serving for the drain delay, so load
+	// balancers see the 503 and stop routing here before the listener closes.
+	draining.Store(true)
+	if cfg.ShutdownDrainDelay > 0 {
+		time.Sleep(cfg.ShutdownDrainDelay)
+	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
