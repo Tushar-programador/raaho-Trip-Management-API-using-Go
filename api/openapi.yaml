@@ -1,0 +1,456 @@
+openapi: 3.0.3
+info:
+  title: Trip Management API
+  version: 1.0.0
+  description: |
+    Create, list, inspect, transition and delete trips.
+
+    Trip status follows a strict state machine:
+
+    | From         | Allowed to                |
+    |--------------|---------------------------|
+    | `CREATED`    | `ASSIGNED`, `CANCELLED`   |
+    | `ASSIGNED`   | `IN_TRANSIT`, `CANCELLED` |
+    | `IN_TRANSIT` | `COMPLETED`               |
+    | `COMPLETED`  | — (terminal)              |
+    | `CANCELLED`  | — (terminal)              |
+
+    Status changes are validated against the persisted status while the trip
+    row is locked, so concurrent updates cannot bypass the rules.
+
+    All error responses use the `ErrorResponse` envelope. Every response carries
+    an `X-Request-ID` header; send your own (1-128 chars of `[A-Za-z0-9._-]`) to
+    correlate requests across services.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Trips
+  - name: Operations
+
+paths:
+  /trips:
+    post:
+      tags: [Trips]
+      operationId: createTrip
+      summary: Create a trip
+      description: |
+        Creates a trip in status `CREATED`. The server generates `id`, `status`,
+        `created_at` and `updated_at`; clients cannot set them. String fields
+        are trimmed of surrounding whitespace before validation and storage.
+
+        Send an `Idempotency-Key` to make retries safe: repeating the key with
+        the same body returns the original `201` response (with
+        `Idempotent-Replayed: true`) without creating another trip; repeating it
+        with a different body returns `409 IDEMPOTENCY_KEY_REUSED`. Only
+        successful creations are remembered, for `IDEMPOTENCY_TTL` (default 24h).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTripRequest'
+            example:
+              trip_number: TRIP-1001
+              source: Mumbai
+              destination: Pune
+              driver_name: Ravi Kumar
+      responses:
+        '201':
+          description: Trip created (or original result replayed for a repeated Idempotency-Key)
+          headers:
+            Location:
+              description: URL of the created trip
+              schema: { type: string, example: /trips/0192f3a4-5b6c-7d8e-9f01-23456789abcd }
+            Idempotent-Replayed:
+              description: Present with value `true` when this is a replay of an earlier result
+              schema: { type: string, enum: ['true'] }
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trip'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Trip number already exists, or Idempotency-Key reused with a different body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                duplicateTripNumber:
+                  value:
+                    error:
+                      code: TRIP_NUMBER_EXISTS
+                      message: A trip with this trip_number already exists
+                      request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+                idempotencyKeyReused:
+                  value:
+                    error:
+                      code: IDEMPOTENCY_KEY_REUSED
+                      message: Idempotency-Key has already been used with a different request body
+                      request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Trips]
+      operationId: listTrips
+      summary: List trips
+      description: |
+        Returns trips newest first (`created_at DESC, id DESC`), optionally
+        filtered by status. Out-of-range pagination values are rejected, not
+        clamped. Requesting a page past the end returns an empty `data` array.
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000000, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/TripStatus'
+      responses:
+        '200':
+          description: A page of trips
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TripList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /trips/{id}:
+    parameters:
+      - $ref: '#/components/parameters/TripID'
+    get:
+      tags: [Trips]
+      operationId: getTrip
+      summary: Get a trip
+      responses:
+        '200':
+          description: The trip
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trip'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/TripNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Trips]
+      operationId: deleteTrip
+      summary: Delete a trip
+      description: |
+        Physically deletes the trip. Trips in any status, including terminal
+        ones, can be deleted. Returns `404` if no trip was deleted.
+      responses:
+        '204':
+          description: Trip deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/TripNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /trips/{id}/status:
+    parameters:
+      - $ref: '#/components/parameters/TripID'
+    patch:
+      tags: [Trips]
+      operationId: updateTripStatus
+      summary: Change a trip's status
+      description: |
+        Moves the trip to `status` if the transition is allowed from its
+        current persisted status. Setting the current status again is not a
+        transition and is rejected with `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateStatusRequest'
+            example:
+              status: ASSIGNED
+      responses:
+        '200':
+          description: The updated trip
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trip'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/TripNotFound'
+        '409':
+          description: Transition not allowed from the current status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: INVALID_STATUS_TRANSITION
+                  message: cannot transition trip from CREATED to IN_TRANSIT
+                  request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: liveness
+      summary: Liveness probe (process is running; does not check the database)
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readiness
+      summary: Readiness probe (database reachable and not shutting down)
+      responses:
+        '200':
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /openapi.yaml:
+    get:
+      tags: [Operations]
+      operationId: openapi
+      summary: This OpenAPI document
+      responses:
+        '200':
+          description: OpenAPI 3.0 document
+          content:
+            application/yaml: {}
+
+components:
+  parameters:
+    TripID:
+      name: id
+      in: path
+      required: true
+      description: Trip ID in canonical 36-character UUID form
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: 1-255 printable ASCII characters without spaces (a UUID is recommended)
+      schema: { type: string, minLength: 1, maxLength: 255, pattern: '^[!-~]+$' }
+
+  headers:
+    RequestID:
+      description: Request correlation ID (echoed from the request or generated)
+      schema: { type: string }
+
+  schemas:
+    TripStatus:
+      type: string
+      enum: [CREATED, ASSIGNED, IN_TRANSIT, COMPLETED, CANCELLED]
+
+    CreateTripRequest:
+      type: object
+      additionalProperties: false
+      required: [trip_number, source, destination, driver_name]
+      properties:
+        trip_number:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Unique (case-sensitive) business identifier
+        source: { type: string, minLength: 1, maxLength: 255 }
+        destination: { type: string, minLength: 1, maxLength: 255 }
+        driver_name: { type: string, minLength: 1, maxLength: 100 }
+
+    UpdateStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/TripStatus'
+
+    Trip:
+      type: object
+      required: [id, trip_number, source, destination, driver_name, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid, example: 0192f3a4-5b6c-7d8e-9f01-23456789abcd }
+        trip_number: { type: string, example: TRIP-1001 }
+        source: { type: string, example: Mumbai }
+        destination: { type: string, example: Pune }
+        driver_name: { type: string, example: Ravi Kumar }
+        status:
+          $ref: '#/components/schemas/TripStatus'
+        created_at: { type: string, format: date-time, description: UTC, example: '2026-10-24T09:15:02.123456Z' }
+        updated_at: { type: string, format: date-time, description: UTC, example: '2026-10-24T09:15:02.123456Z' }
+
+    TripList:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Trip'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    Pagination:
+      type: object
+      required: [page, page_size, total_items, total_pages]
+      properties:
+        page: { type: integer, example: 1 }
+        page_size: { type: integer, example: 20 }
+        total_items: { type: integer, example: 42 }
+        total_pages: { type: integer, example: 3 }
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - INVALID_JSON
+                - INVALID_STATUS
+                - UNSUPPORTED_MEDIA_TYPE
+                - PAYLOAD_TOO_LARGE
+                - TRIP_NOT_FOUND
+                - TRIP_NUMBER_EXISTS
+                - INVALID_STATUS_TRANSITION
+                - IDEMPOTENCY_KEY_REUSED
+                - ROUTE_NOT_FOUND
+                - METHOD_NOT_ALLOWED
+                - INTERNAL_ERROR
+                - SERVICE_UNAVAILABLE
+            message:
+              type: string
+              description: Human-readable; do not parse
+            request_id:
+              type: string
+            details:
+              type: array
+              description: Per-field problems (VALIDATION_ERROR only)
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field: { type: string, example: source }
+                  message: { type: string, example: is required }
+
+  responses:
+    BadRequest:
+      description: Invalid JSON, invalid field values, invalid UUID, invalid status or invalid query parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validation:
+              value:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Request validation failed
+                  request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+                  details:
+                    - { field: source, message: is required }
+            invalidJson:
+              value:
+                error:
+                  code: INVALID_JSON
+                  message: Request body contains unknown field "status"
+                  request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+            invalidStatus:
+              value:
+                error:
+                  code: INVALID_STATUS
+                  message: 'invalid status "DONE": must be one of CREATED, ASSIGNED, IN_TRANSIT, COMPLETED, CANCELLED'
+                  request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+    TripNotFound:
+      description: No trip with this ID
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: TRIP_NOT_FOUND
+              message: Trip not found
+              request_id: 7f2c1d9e-1c1b-4a43-9a8e-3f5e2b8c0a11
+    PayloadTooLarge:
+      description: Request body exceeds MAX_BODY_BYTES
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnsupportedMediaType:
+      description: Content-Type is not application/json
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: Unexpected server error (details are logged, never returned)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: The database is unreachable or timed out, or the server is shutting down
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
