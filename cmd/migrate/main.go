@@ -44,7 +44,8 @@ func run(args []string) error {
 	}
 
 	log := logger.New(os.Stdout, "text", 0)
-	pool, err := database.Connect(context.Background(), url, 2, 30*time.Second, log)
+	// No statement or lock timeout: a migration may legitimately run long.
+	pool, err := database.Connect(context.Background(), url, database.PoolOptions{MaxConns: 2, ConnectTimeout: 30 * time.Second}, log)
 	if err != nil {
 		return err
 	}

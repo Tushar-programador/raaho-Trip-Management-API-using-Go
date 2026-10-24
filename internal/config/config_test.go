@@ -36,6 +36,20 @@ func TestLoadReportsAllErrors(t *testing.T) {
 	}
 }
 
+func TestDatabaseTimeoutsMustNest(t *testing.T) {
+	cases := map[string]map[string]string{
+		"DB_STATEMENT_TIMEOUT": {"DB_STATEMENT_TIMEOUT": "10s", "REQUEST_TIMEOUT": "10s"},
+		"DB_LOCK_TIMEOUT":      {"DB_LOCK_TIMEOUT": "6s", "DB_STATEMENT_TIMEOUT": "5s"},
+	}
+	for want, vars := range cases {
+		vars["DATABASE_URL"] = "postgres://localhost/db"
+		_, err := LoadFrom(env(vars))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%v: expected %s error, got %v", vars, want, err)
+		}
+	}
+}
+
 func TestRequestTimeoutMustBeBelowWriteTimeout(t *testing.T) {
 	_, err := LoadFrom(env(map[string]string{
 		"DATABASE_URL":       "postgres://localhost/db",

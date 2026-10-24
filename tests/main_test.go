@@ -32,6 +32,8 @@ import (
 	"github.com/Tushar-programador/trip-management-api/migrations"
 )
 
+const lockTimeout = 2 * time.Second
+
 var (
 	pool    *pgxpool.Pool // direct database access for assertions
 	baseURL string        // the API under test
@@ -59,7 +61,14 @@ func runWithDatabase(m *testing.M, url string) int {
 	var err error
 	// Enough connections that concurrent requests really contend inside
 	// PostgreSQL instead of queueing for a pool slot.
-	pool, err = database.Connect(ctx, url, 32, 15*time.Second, log)
+	// A short lock timeout keeps TestStatusUpdateLockTimeout fast; it is still
+	// far longer than any lock wait in the other tests.
+	pool, err = database.Connect(ctx, url, database.PoolOptions{
+		MaxConns:         32,
+		ConnectTimeout:   15 * time.Second,
+		StatementTimeout: 10 * time.Second,
+		LockTimeout:      lockTimeout,
+	}, log)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "connect:", err)
 		return 1
@@ -78,7 +87,7 @@ func runWithDatabase(m *testing.M, url string) int {
 }
 
 func migrateUp(ctx context.Context, url string, log *slog.Logger) error {
-	p, err := database.Connect(ctx, url, 2, 15*time.Second, log)
+	p, err := database.Connect(ctx, url, database.PoolOptions{MaxConns: 2, ConnectTimeout: 15 * time.Second}, log)
 	if err != nil {
 		return err
 	}

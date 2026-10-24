@@ -238,6 +238,44 @@ func TestStatusUpdateWaitsForRowLock(t *testing.T) {
 	}
 }
 
+// TestStatusUpdateLockTimeout: when a row stays locked longer than
+// lock_timeout, PostgreSQL itself abandons the wait. The client gets a
+// retryable 503, the trip is untouched, and no backend is left queued on the
+// lock (a cancelled Go context alone would leave the server-side waiter behind).
+func TestStatusUpdateLockTimeout(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	trip := mustCreate(t, "T-LOCK-TIMEOUT")
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM trips WHERE id = $1 FOR UPDATE`, trip.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	r := send(t, http.MethodPatch, "/trips/"+trip.ID.String()+"/status", map[string]string{"status": "ASSIGNED"}, nil)
+	if r.Status != http.StatusServiceUnavailable || r.errorBody(t).Code != "SERVICE_UNAVAILABLE" {
+		t.Fatalf("status %d: %s, want 503 SERVICE_UNAVAILABLE", r.Status, r.Body)
+	}
+	if elapsed := time.Since(start); elapsed < lockTimeout {
+		t.Errorf("returned after %s, before lock_timeout %s", elapsed, lockTimeout)
+	}
+	if n := countRows(t, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`); n != 0 {
+		t.Errorf("%d backends still waiting on a lock", n)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if s := dbStatus(t, trip.ID); s != domain.StatusCreated {
+		t.Errorf("status = %s after timed-out update", s)
+	}
+}
+
 // waitForLockWaiter polls PostgreSQL until a backend is blocked on a lock.
 func waitForLockWaiter(t *testing.T) {
 	t.Helper()

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,25 +18,44 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+// PoolOptions tunes the connection pool. Zero timeouts keep the server default
+// (no limit), which is what schema migrations need.
+type PoolOptions struct {
+	MaxConns       int32
+	ConnectTimeout time.Duration
+	// StatementTimeout and LockTimeout are enforced by PostgreSQL itself. A
+	// cancelled Go context only closes the client socket, and a backend that
+	// is queued on a row lock does not notice that, so without a server-side
+	// lock_timeout an abandoned waiter would stay queued on the server.
+	StatementTimeout time.Duration
+	LockTimeout      time.Duration
+}
+
 // Connect creates a pool and waits until PostgreSQL answers a ping, retrying
-// with backoff until connectTimeout elapses. This tolerates the database
+// with backoff until opts.ConnectTimeout elapses. This tolerates the database
 // starting slightly after the API without hiding a real outage.
-func Connect(ctx context.Context, url string, maxConns int32, connectTimeout time.Duration, log *slog.Logger) (*pgxpool.Pool, error) {
+func Connect(ctx context.Context, url string, opts PoolOptions, log *slog.Logger) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		// The parse error can echo the URL, which may contain a password.
 		return nil, errors.New("database: invalid DATABASE_URL")
 	}
-	cfg.MaxConns = maxConns
+	cfg.MaxConns = opts.MaxConns
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
+	if opts.StatementTimeout > 0 {
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(opts.StatementTimeout.Milliseconds(), 10)
+	}
+	if opts.LockTimeout > 0 {
+		cfg.ConnConfig.RuntimeParams["lock_timeout"] = strconv.FormatInt(opts.LockTimeout.Milliseconds(), 10)
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("database: create pool: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
+	ctx, cancel := context.WithTimeout(ctx, opts.ConnectTimeout)
 	defer cancel()
 	backoff := 250 * time.Millisecond
 	for {
@@ -49,7 +69,7 @@ func Connect(ctx context.Context, url string, maxConns int32, connectTimeout tim
 		select {
 		case <-ctx.Done():
 			pool.Close()
-			return nil, fmt.Errorf("database: not reachable within %s: %w", connectTimeout, err)
+			return nil, fmt.Errorf("database: not reachable within %s: %w", opts.ConnectTimeout, err)
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, 5*time.Second)

@@ -451,7 +451,11 @@ sequenceDiagram
 - Under `READ COMMITTED`, a transaction blocked on `FOR UPDATE` re-reads the **latest committed** row version once the lock is granted, so validation never runs on a stale value.
 - The lock lives in PostgreSQL, not in process memory, so it is equally correct with one replica or fifty. There are no application mutexes.
 - Locks are per row, so updates to different trips never contend. Each transaction touches exactly one row, so there are no lock-ordering deadlocks.
-- `pgx.BeginFunc` rolls back on any error or panic. The request-scoped context (bounded by `REQUEST_TIMEOUT`) cancels a stuck query and releases the lock.
+- `pgx.BeginFunc` rolls back on any error or panic.
+- Waiting is bounded on the server, not just in Go. Every connection sets PostgreSQL's `lock_timeout` (`DB_LOCK_TIMEOUT`, 2s) and `statement_timeout` (`DB_STATEMENT_TIMEOUT`, 5s), and both are below `REQUEST_TIMEOUT`.
+  - A request stuck behind a long-held lock gets a retryable `503`.
+  - PostgreSQL removes the waiter from the lock queue.
+  - A cancelled Go context alone only closes the socket, and that would leave the server-side backend waiting. `TestStatusUpdateLockTimeout` checks this.
 - Transition logic stays in the domain package. The repository only supplies the transactional frame.
 
 **How it is tested** (`tests/concurrency_test.go`, real PostgreSQL, independent HTTP requests, no sleeps used as synchronization):
@@ -549,7 +553,7 @@ Every error uses one envelope:
 | 413 | `PAYLOAD_TOO_LARGE` | Body larger than `MAX_BODY_BYTES` |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | `Content-Type` is not `application/json` |
 | 500 | `INTERNAL_ERROR` | Unexpected failure; details are logged, never returned |
-| 503 | `SERVICE_UNAVAILABLE` | Database unreachable or timed out, or the server is draining for shutdown |
+| 503 | `SERVICE_UNAVAILABLE` | Database unreachable or timed out, trip row locked longer than `DB_LOCK_TIMEOUT`, or the server is draining for shutdown |
 
 `422` is deliberately not used. All client input problems are `400`, which keeps the contract simple and consistent.
 
@@ -576,6 +580,8 @@ All configuration comes from environment variables. The values are validated at 
 | `MAX_BODY_BYTES` | `65536` | Request body limit (`413` above it) |
 | `DB_MAX_CONNS` | `10` | Connection pool size |
 | `DB_CONNECT_TIMEOUT` | `30s` | How long startup retries reaching the database before failing |
+| `DB_STATEMENT_TIMEOUT` | `5s` | PostgreSQL `statement_timeout` per connection; must be less than `REQUEST_TIMEOUT` |
+| `DB_LOCK_TIMEOUT` | `2s` | PostgreSQL `lock_timeout` per connection (`503` when exceeded); must not exceed `DB_STATEMENT_TIMEOUT` |
 | `IDEMPOTENCY_TTL` | `24h` | How long an `Idempotency-Key` is remembered |
 
 Compose-only variables (from `.env`): `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT` (host port, default `5432`), `API_PORT` (host port, default `8080`). The integration tests read `TEST_DATABASE_URL`.

@@ -269,6 +269,10 @@ func mapError(err error) error {
 		return domain.ErrTripNumberExists
 	case errors.As(err, &connErr), errors.Is(err, context.DeadlineExceeded):
 		return fmt.Errorf("%w: %w", domain.ErrUnavailable, err)
+	case errors.As(err, &pgErr) && (pgErr.Code == "55P03" || pgErr.Code == "57014"):
+		// lock_timeout (lock_not_available) or statement_timeout (query_canceled):
+		// the row is busy or the database is slow; the client may retry.
+		return fmt.Errorf("%w: %w", domain.ErrUnavailable, err)
 	default:
 		// Domain errors (TransitionError, ErrIdempotencyKeyReused) pass through
 		// unchanged; errors.Is/As still match wrapped driver errors.

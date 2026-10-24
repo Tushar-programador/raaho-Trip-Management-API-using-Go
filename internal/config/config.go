@@ -14,20 +14,22 @@ import (
 
 // Config is the fully validated application configuration.
 type Config struct {
-	HTTPAddr          string
-	DatabaseURL       string
-	LogLevel          slog.Level
-	LogFormat         string // "json" or "text"
-	ReadHeaderTimeout time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	IdleTimeout       time.Duration
-	RequestTimeout    time.Duration
-	ShutdownTimeout   time.Duration
-	MaxBodyBytes      int64
-	DBMaxConns        int32
-	DBConnectTimeout  time.Duration
-	IdempotencyTTL    time.Duration
+	HTTPAddr           string
+	DatabaseURL        string
+	LogLevel           slog.Level
+	LogFormat          string // "json" or "text"
+	ReadHeaderTimeout  time.Duration
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	IdleTimeout        time.Duration
+	RequestTimeout     time.Duration
+	ShutdownTimeout    time.Duration
+	MaxBodyBytes       int64
+	DBMaxConns         int32
+	DBConnectTimeout   time.Duration
+	DBStatementTimeout time.Duration
+	DBLockTimeout      time.Duration
+	IdempotencyTTL     time.Duration
 }
 
 // Load reads configuration using os.Getenv.
@@ -40,20 +42,22 @@ func Load() (Config, error) {
 func LoadFrom(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
 	cfg := Config{
-		HTTPAddr:          p.str("HTTP_ADDR", ":8080"),
-		DatabaseURL:       p.str("DATABASE_URL", ""),
-		LogLevel:          p.level("LOG_LEVEL", slog.LevelInfo),
-		LogFormat:         strings.ToLower(p.str("LOG_FORMAT", "json")),
-		ReadHeaderTimeout: p.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
-		ReadTimeout:       p.duration("HTTP_READ_TIMEOUT", 10*time.Second),
-		WriteTimeout:      p.duration("HTTP_WRITE_TIMEOUT", 15*time.Second),
-		IdleTimeout:       p.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
-		RequestTimeout:    p.duration("REQUEST_TIMEOUT", 10*time.Second),
-		ShutdownTimeout:   p.duration("SHUTDOWN_TIMEOUT", 20*time.Second),
-		MaxBodyBytes:      p.int64("MAX_BODY_BYTES", 64<<10),
-		DBMaxConns:        int32(p.int64("DB_MAX_CONNS", 10)),
-		DBConnectTimeout:  p.duration("DB_CONNECT_TIMEOUT", 30*time.Second),
-		IdempotencyTTL:    p.duration("IDEMPOTENCY_TTL", 24*time.Hour),
+		HTTPAddr:           p.str("HTTP_ADDR", ":8080"),
+		DatabaseURL:        p.str("DATABASE_URL", ""),
+		LogLevel:           p.level("LOG_LEVEL", slog.LevelInfo),
+		LogFormat:          strings.ToLower(p.str("LOG_FORMAT", "json")),
+		ReadHeaderTimeout:  p.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+		ReadTimeout:        p.duration("HTTP_READ_TIMEOUT", 10*time.Second),
+		WriteTimeout:       p.duration("HTTP_WRITE_TIMEOUT", 15*time.Second),
+		IdleTimeout:        p.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+		RequestTimeout:     p.duration("REQUEST_TIMEOUT", 10*time.Second),
+		ShutdownTimeout:    p.duration("SHUTDOWN_TIMEOUT", 20*time.Second),
+		MaxBodyBytes:       p.int64("MAX_BODY_BYTES", 64<<10),
+		DBMaxConns:         int32(p.int64("DB_MAX_CONNS", 10)),
+		DBConnectTimeout:   p.duration("DB_CONNECT_TIMEOUT", 30*time.Second),
+		DBStatementTimeout: p.duration("DB_STATEMENT_TIMEOUT", 5*time.Second),
+		DBLockTimeout:      p.duration("DB_LOCK_TIMEOUT", 2*time.Second),
+		IdempotencyTTL:     p.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -70,6 +74,8 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		"REQUEST_TIMEOUT":          cfg.RequestTimeout,
 		"SHUTDOWN_TIMEOUT":         cfg.ShutdownTimeout,
 		"DB_CONNECT_TIMEOUT":       cfg.DBConnectTimeout,
+		"DB_STATEMENT_TIMEOUT":     cfg.DBStatementTimeout,
+		"DB_LOCK_TIMEOUT":          cfg.DBLockTimeout,
 		"IDEMPOTENCY_TTL":          cfg.IdempotencyTTL,
 	} {
 		if d <= 0 {
@@ -79,6 +85,14 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	// A handler must give up (and answer) before the server kills the connection.
 	if cfg.RequestTimeout >= cfg.WriteTimeout {
 		p.fail("REQUEST_TIMEOUT must be less than HTTP_WRITE_TIMEOUT")
+	}
+	// PostgreSQL must give up on a query (and leave any lock queue) before
+	// the handler's context expires and abandons the connection.
+	if cfg.DBStatementTimeout >= cfg.RequestTimeout {
+		p.fail("DB_STATEMENT_TIMEOUT must be less than REQUEST_TIMEOUT")
+	}
+	if cfg.DBLockTimeout > cfg.DBStatementTimeout {
+		p.fail("DB_LOCK_TIMEOUT must not exceed DB_STATEMENT_TIMEOUT")
 	}
 	if cfg.MaxBodyBytes < 1024 {
 		p.fail("MAX_BODY_BYTES must be at least 1024")
