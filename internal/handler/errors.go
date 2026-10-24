@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,10 @@ const (
 	CodeInternal                = "INTERNAL_ERROR"
 	CodeServiceUnavailable      = "SERVICE_UNAVAILABLE"
 )
+
+// StatusClientClosedRequest is recorded (in logs only) when the client
+// disconnects before the response is ready. It is a de facto standard from nginx.
+const StatusClientClosedRequest = 499
 
 // apiError is an error raised by the HTTP layer itself (bad JSON, wrong
 // content type, ...) that already knows its status and code.
@@ -83,6 +88,14 @@ func mapError(err error) (int, errorDetail) {
 // writeError logs server-side failures with full detail and sends the client
 // the sanitized payload plus the request ID for correlation.
 func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
+	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		// The client disconnected, so nobody will read a response and nothing
+		// failed on our side. Record it with nginx's 499 rather than as a 5xx.
+		log.InfoContext(r.Context(), "client closed request", "request_id", middleware.RequestIDFromContext(r.Context()))
+		w.WriteHeader(StatusClientClosedRequest)
+		return
+	}
+
 	status, detail := mapError(err)
 	detail.RequestID = middleware.RequestIDFromContext(r.Context())
 	if status >= 500 {

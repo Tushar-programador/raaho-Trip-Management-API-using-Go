@@ -268,6 +268,41 @@ func TestReadiness(t *testing.T) {
 	}
 }
 
+// levelRecorder is a slog handler that remembers the highest level logged.
+type levelRecorder struct{ max atomic.Int64 }
+
+func (l *levelRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (l *levelRecorder) Handle(_ context.Context, r slog.Record) error {
+	for {
+		cur := l.max.Load()
+		if int64(r.Level) <= cur || l.max.CompareAndSwap(cur, int64(r.Level)) {
+			return nil
+		}
+	}
+}
+func (l *levelRecorder) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *levelRecorder) WithGroup(string) slog.Handler      { return l }
+
+func TestClientDisconnectIsNotAServerError(t *testing.T) {
+	rec := &levelRecorder{}
+	rec.max.Store(int64(slog.LevelDebug))
+	h := NewRouter(&fakeService{getErr: fmt.Errorf("query: %w", context.Canceled)}, slog.New(rec),
+		RouterOptions{RequestTimeout: 5 * time.Second, MaxBodyBytes: 1024})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client has already gone away
+	req := httptest.NewRequest(http.MethodGet, "/trips/"+uuid.NewString(), nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != StatusClientClosedRequest || w.Body.Len() != 0 {
+		t.Errorf("got %d %q, want bare 499", w.Code, w.Body)
+	}
+	if slog.Level(rec.max.Load()) >= slog.LevelError {
+		t.Error("client disconnect was logged at error level")
+	}
+}
+
 func TestMapError(t *testing.T) {
 	cases := []struct {
 		err        error

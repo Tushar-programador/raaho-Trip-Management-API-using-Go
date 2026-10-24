@@ -559,6 +559,8 @@ Every error uses one envelope:
 
 SQL text, driver messages, constraint names and stack traces never reach clients. Unknown errors become a generic `500` and are logged with the request ID.
 
+If a client disconnects before its response is ready, no response is sent. The request is logged at `info` with status `499` (the nginx convention), so client hang-ups do not count as server errors.
+
 ---
 
 ## Configuration
@@ -653,6 +655,7 @@ The Makefile loads `.env` automatically. Without `make`, export the variables fr
 | Domain unit tests | `internal/domain` | no | All 25 transition pairs, terminal states, status parsing, field validation and length limits (in characters), trimming, fingerprints, idempotency-key rules |
 | Handler unit tests | `internal/handler` | no | Malformed, empty, unknown-field, wrong-type and oversized bodies; wrong content type; invalid UUID forms; pagination defaults, bounds and invalid values; error-to-HTTP mapping; panic recovery without leaks; request-ID propagation; readiness while draining |
 | Config unit tests | `internal/config` | no | Defaults, aggregated errors, timeout invariants |
+| Repository unit tests | `internal/repository` | no | Driver-to-domain error mapping: constraint names, connection-loss and timeout classes, client cancellation |
 | Integration tests | `tests/` | **yes** | Every endpoint end to end through the real router, service, repository and PostgreSQL, plus DB constraints, concurrency and idempotency |
 
 Run the tests:
@@ -701,7 +704,12 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 - **Container:** distroless, non-root, static binary, no shell. Credentials come only from the environment; nothing is baked into the image.
 - **Health:** `/healthz` (liveness) never touches the database, so a DB outage does not trigger restart loops. `/readyz` checks the database and returns `503` while draining. Startup fails loudly on bad config, an unreachable DB (after `DB_CONNECT_TIMEOUT`), or an outdated schema.
 - **Graceful shutdown:** on SIGTERM, readiness turns to `503`, in-flight requests finish within `SHUTDOWN_TIMEOUT`, then the pool closes.
-- **Dependency outages:** connection failures and timeouts map to `503 SERVICE_UNAVAILABLE` and the service recovers automatically. This was verified by stopping PostgreSQL under a running API.
+- **Dependency outages:** the following all map to a retryable `503 SERVICE_UNAVAILABLE`, and the service recovers automatically:
+  - connection failures;
+  - connections lost mid-query (restart, failover, dropped socket);
+  - lock and statement timeouts.
+
+  This was verified by stopping PostgreSQL under a running API.
 
 **Required before real production use:**
 

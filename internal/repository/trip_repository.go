@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -261,21 +264,47 @@ func scanTrip(row pgx.Row) (domain.Trip, error) {
 // recognise is returned wrapped and is reported to clients as an internal error.
 func mapError(err error) error {
 	var pgErr *pgconn.PgError
-	var connErr *pgconn.ConnectError
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return domain.ErrTripNotFound
 	case errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "trips_trip_number_key":
 		return domain.ErrTripNumberExists
-	case errors.As(err, &connErr), errors.Is(err, context.DeadlineExceeded):
-		return fmt.Errorf("%w: %w", domain.ErrUnavailable, err)
-	case errors.As(err, &pgErr) && (pgErr.Code == "55P03" || pgErr.Code == "57014"):
-		// lock_timeout (lock_not_available) or statement_timeout (query_canceled):
-		// the row is busy or the database is slow; the client may retry.
+	case errors.Is(err, context.Canceled):
+		// The client went away; the handler records this without treating it
+		// as a server failure.
+		return err
+	case isUnavailable(err):
 		return fmt.Errorf("%w: %w", domain.ErrUnavailable, err)
 	default:
 		// Domain errors (TransitionError, ErrIdempotencyKeyReused) pass through
 		// unchanged; errors.Is/As still match wrapped driver errors.
 		return err
 	}
+}
+
+// isUnavailable reports transient database failures a client can retry: the
+// server could not be reached, went away mid-query (restart, failover,
+// dropped socket), or gave up on a lock or statement timeout.
+func isUnavailable(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"): // connection_exception class
+			return true
+		case pgErr.Code == "57P01", pgErr.Code == "57P02", pgErr.Code == "57P03": // admin/crash shutdown, cannot_connect_now
+			return true
+		case pgErr.Code == "55P03", pgErr.Code == "57014": // lock_timeout, statement_timeout
+			return true
+		}
+		return false
+	}
+	var connErr *pgconn.ConnectError
+	var netErr net.Error
+	return errors.As(err, &connErr) ||
+		errors.As(err, &netErr) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		pgconn.Timeout(err) ||
+		pgconn.SafeToRetry(err)
 }
