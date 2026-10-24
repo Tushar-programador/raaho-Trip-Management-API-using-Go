@@ -1,0 +1,11 @@
+.git
+.gitignore
+.vscode
+.idea
+.env
+.env.*
+bin
+*.out
+coverage.html
+Dockerfile
+docker-compose.yml
