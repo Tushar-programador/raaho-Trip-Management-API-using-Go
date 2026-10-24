@@ -70,7 +70,7 @@ Prerequisites: **Docker** with Compose v2. For running outside Docker you also n
 ```bash
 git clone https://github.com/Tushar-programador/trip-management-api.git
 cd trip-management-api
-cp .env.example .env            # local defaults; edit ports here if 5432/8080 are taken
+cp .env.example .env            # local defaults (see the note below if 5432/8080 are taken)
 
 make docker-up                  # or: docker compose up -d --build --wait
 curl http://localhost:8080/readyz
@@ -78,6 +78,8 @@ curl http://localhost:8080/readyz
 ```
 
 `docker-up` starts PostgreSQL, waits for it to be healthy, runs the migrations once in a separate container, and only then starts the API. The command returns when the API's health check passes.
+
+If port 5432 or 8080 is already in use, set `POSTGRES_PORT` and `API_PORT` in `.env`. If you change `POSTGRES_PORT`, also update the port in `DATABASE_URL` and `TEST_DATABASE_URL`; the host-side commands (`make run`, `make migrate-up`, `make test-integration`) use those URLs.
 
 Stop with `make docker-down` (or `docker compose down`). Add `-v` to `docker compose down` to also delete the database volume.
 
