@@ -2,7 +2,7 @@
 
 A production-oriented REST service in Go for managing the lifecycle of transport trips: create a trip, assign it, move it through transit to completion (or cancel it), and query trips with pagination and filtering.
 
-The interesting part is not the CRUD. It is that **business rules hold under concurrency and across multiple API instances**: status changes are validated against the *persisted* state while the row is locked in PostgreSQL, trip numbers are unique by database constraint, and `POST /trips` supports durable, race-safe `Idempotency-Key` retries.
+The interesting part is not the CRUD. It is that **business rules hold under concurrency and across multiple API instances**: status changes are validated against the *persisted* state while the row is locked in PostgreSQL, trip numbers are unique by database constraint, and `POST /trips` supports durable, race-safe `Idempotency-Key` retries. Every trip endpoint requires a revocable per-client API key, and the API process connects to PostgreSQL as a role that cannot alter or drop the schema.
 
 ---
 
@@ -39,7 +39,9 @@ The interesting part is not the CRUD. It is that **business rules hold under con
 | Strict state machine | Transition table in the domain layer, enforced inside a locking transaction |
 | Safe concurrent updates | `SELECT ... FOR UPDATE` in PostgreSQL, so it also holds across replicas |
 | Unique trip numbers | `UNIQUE` constraint; concurrent duplicates resolved by the database |
-| Idempotent creation | Optional `Idempotency-Key` header, stored durably in PostgreSQL |
+| Idempotent creation | Optional `Idempotency-Key` header, stored durably in PostgreSQL, scoped per client |
+| Authentication | Per-client API keys (`Authorization: Bearer`), stored only as SHA-256 hashes, revocable instantly |
+| Least-privilege database access | The API's role reads and writes rows but cannot alter, drop or truncate anything |
 | Pagination and filtering | `page`, `page_size` (max 100) and `status`, deterministic ordering, index-backed |
 | Strict input handling | Unknown fields, malformed JSON, wrong content type and oversized bodies are rejected |
 | Consistent errors | One error envelope with stable codes and a request ID; no internals leaked |
@@ -75,7 +77,14 @@ cp .env.example .env            # local defaults (see the note below if 5432/808
 make docker-up                  # or: docker compose up -d --build --wait
 curl http://localhost:8080/readyz
 # {"status":"ready"}
+
+# Create an API key (printed once) and call the API with it
+export API_KEY=$(docker compose run --rm -T --no-deps --entrypoint /app/apikey migrate create local-dev)
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/trips
+# {"data":[],"pagination":{"page":1,"page_size":20,"total_items":0,"total_pages":0}}
 ```
+
+`make api-key NAME=local-dev` runs the same key-creation command. On Git Bash for Windows, prefix `docker compose run` commands with `MSYS_NO_PATHCONV=1`, so that `/app/apikey` is not rewritten into a Windows path.
 
 `docker-up` starts PostgreSQL, waits for it to be healthy, runs the migrations once in a separate container, and only then starts the API. The command returns when the API's health check passes.
 
@@ -94,7 +103,7 @@ flowchart LR
     C[Client] -->|HTTP| MW
 
     subgraph API process
-      MW[Middleware<br/>request ID · logging · recovery<br/>body limit · timeout] --> H[Handler<br/>parse · validate input · map errors]
+      MW[Middleware<br/>request ID · logging · recovery<br/>body limit · timeout · API-key auth] --> H[Handler<br/>parse · validate input · map errors]
       H --> S[Service<br/>use cases · normalization · idempotency]
       S --> D[Domain<br/>Trip · Status · transitions · errors]
       S --> R[Repository<br/>SQL · transactions · locking]
@@ -107,17 +116,19 @@ flowchart LR
 |---|---|---|
 | Entry point | `cmd/api` | Load config, connect, verify schema version, start server, graceful shutdown |
 | Middleware | `internal/middleware` | Request ID, panic recovery, access logs, request timeout, body size limit |
+| Auth | `internal/auth` | API-key generation and hashing; bearer middleware that resolves a key to a client |
 | Handler | `internal/handler` | Routing, strict JSON decoding, query parsing, response and error serialization |
 | Service | `internal/service` | Normalize and validate input, generate IDs, build idempotency fingerprints |
 | Domain | `internal/domain` | Trip model, statuses, transition table, validation rules, domain errors |
 | Repository | `internal/repository` | All SQL, transaction boundaries, row locks, driver-to-domain error mapping |
 | Platform | `internal/platform/*` | Connection pool, schema check, migrator, logger |
+| Admin CLIs | `cmd/migrate`, `cmd/apikey` | Schema migrations and API-key management, run as the schema owner |
 
-There is exactly one interface: `handler.TripService`, declared at the consumer so handler tests can run without a database. Everything else uses concrete types.
+There are two small interfaces, `handler.TripService` and `auth.ClientStore`. Both are declared at the consumer so handler and middleware tests can run without a database. Everything else uses concrete types.
 
 ### Request flow: `PATCH /trips/{id}/status`
 
-1. Middleware assigns a request ID, caps the body, and bounds the request context with `REQUEST_TIMEOUT`.
+1. Middleware assigns a request ID, caps the body, and bounds the request context with `REQUEST_TIMEOUT`. On `/trips` routes it then resolves the bearer API key to a client, or returns `401`.
 2. The handler validates the UUID and strictly decodes `{"status": ...}`.
 3. The service checks that `status` is one of the five known values (`400 INVALID_STATUS` otherwise).
 4. The repository opens a transaction, locks the row, asks the domain whether *current → requested* is allowed, updates, and commits.
@@ -132,9 +143,11 @@ There is exactly one interface: `handler.TripService`, declared at the consumer 
 │   └── embed.go                # embeds the spec; served at GET /openapi.yaml
 ├── cmd/
 │   ├── api/main.go             # HTTP server (+ `api healthcheck` probe)
-│   └── migrate/main.go         # migration CLI: up | down | version | force N
+│   ├── migrate/main.go         # migration CLI: up | down | version | force N
+│   └── apikey/main.go          # API-key admin CLI: create | list | revoke
 ├── deploy/postgres/init/       # first start: trips_test database, trip_api login role
 ├── internal/
+│   ├── auth/                   # API keys: generation, hashing, bearer middleware
 │   ├── config/                 # env-based config with validation
 │   ├── domain/                 # Trip, Status, transitions, validation, errors
 │   ├── handler/                # routes, JSON I/O, pagination, error mapping
@@ -186,7 +199,7 @@ Both list queries were checked with `EXPLAIN` on 50,000 seeded rows. Each uses a
 
 | Column | Purpose |
 |---|---|
-| `scope`, `idempotency_key` | Composite `PRIMARY KEY`; scope is the operation (`POST /trips`) |
+| `client_id`, `scope`, `idempotency_key` | Composite `PRIMARY KEY`: per client (`REFERENCES api_clients`) and per operation (`POST /trips`) |
 | `request_hash` | SHA-256 fingerprint of the normalized request |
 | `trip_id`, `trip_snapshot` | The trip exactly as first returned (`JSONB`), used for replays |
 | `created_at`, `expires_at` | Retention; expired keys can be reclaimed |
@@ -195,16 +208,27 @@ A `CHECK` constraint ensures a key row either has a complete result or none. An 
 
 Timestamps are `TIMESTAMPTZ`, written by PostgreSQL and always returned in UTC (`2026-10-24T06:39:37.86131Z`).
 
+### `api_clients`
+
+| Column | Purpose |
+|---|---|
+| `id`, `name` | Client identity, recorded as `client_id` in access logs |
+| `key_hash` | SHA-256 of the API key, `UNIQUE`; this is also the index for the per-request lookup |
+| `key_prefix` | First 12 characters of the key, to recognise it in listings |
+| `created_at`, `revoked_at` | A non-null `revoked_at` disables the key on the next request |
+
+The plaintext key is never stored. It is shown once by `apikey create`.
+
 ### Database roles
 
 The API never connects as the schema owner.
 
 | Role | Used by | Can do |
 |---|---|---|
-| Owner (`POSTGRES_USER`, via `ADMIN_DATABASE_URL`) | `migrate` | Everything: DDL, migrations |
-| `trip_api` (via `DATABASE_URL`) | The API | `SELECT/INSERT/UPDATE/DELETE` on `trips` and `idempotency_keys`; `SELECT` on `schema_migrations`. No `ALTER`, `DROP`, `TRUNCATE` or `CREATE`. |
+| Owner (`POSTGRES_USER`, via `ADMIN_DATABASE_URL`) | `migrate`, `apikey` | Everything: DDL, migrations, issuing and revoking API keys |
+| `trip_api` (via `DATABASE_URL`) | The API | `SELECT/INSERT/UPDATE/DELETE` on `trips` and `idempotency_keys`; `SELECT` only on `api_clients` and `schema_migrations`. No `ALTER`, `DROP`, `TRUNCATE` or `CREATE`. |
 
-A bug or SQL injection in the API therefore cannot alter or destroy the schema, or rewrite the migration history.
+A bug or SQL injection in the API therefore cannot alter or destroy the schema, rewrite the migration history, or mint or un-revoke API keys.
 
 - **Grants are in migrations** (`000003_grant_api_role`). Each later table grants `trip_api` exactly what it needs, so privileges are reviewed together with the schema change.
 - **The credential is not.** In Compose, `deploy/postgres/init/02-create-api-role.sh` creates `trip_api` with `LOGIN` and `API_DB_PASSWORD` when the volume is first initialised. Elsewhere, the migration creates the role as `NOLOGIN` if it is missing, and an operator enables it with `ALTER ROLE trip_api LOGIN PASSWORD '...'`.
@@ -247,16 +271,46 @@ The transition table lives in `internal/domain/trip.go`. Its unit test checks al
 
 | Method | Path | Success | Errors |
 |---|---|---|---|
-| `POST` | `/trips` | `201` trip (+`Location`) | `400`, `409`, `413`, `415`, `500`, `503` |
-| `GET` | `/trips` | `200` page | `400`, `500`, `503` |
-| `GET` | `/trips/{id}` | `200` trip | `400`, `404`, `500`, `503` |
-| `PATCH` | `/trips/{id}/status` | `200` trip | `400`, `404`, `409`, `413`, `415`, `500`, `503` |
-| `DELETE` | `/trips/{id}` | `204` | `400`, `404`, `500`, `503` |
+| `POST` | `/trips` | `201` trip (+`Location`) | `400`, `401`, `409`, `413`, `415`, `500`, `503` |
+| `GET` | `/trips` | `200` page | `400`, `401`, `500`, `503` |
+| `GET` | `/trips/{id}` | `200` trip | `400`, `401`, `404`, `500`, `503` |
+| `PATCH` | `/trips/{id}/status` | `200` trip | `400`, `401`, `404`, `409`, `413`, `415`, `500`, `503` |
+| `DELETE` | `/trips/{id}` | `204` | `400`, `401`, `404`, `500`, `503` |
 | `GET` | `/healthz` | `200` liveness | |
 | `GET` | `/readyz` | `200` readiness | `503` |
 | `GET` | `/openapi.yaml` | `200` OpenAPI document | |
 
 Request bodies must be `Content-Type: application/json`. Every response carries an `X-Request-ID` header.
+
+### Authentication
+
+Every `/trips` request must carry an API key:
+
+```
+Authorization: Bearer tma_<43 base64url characters>
+```
+
+- **Errors.** A missing, malformed, unknown or revoked key returns `401 UNAUTHENTICATED` with `WWW-Authenticate: Bearer`. The cases are deliberately indistinguishable.
+- **Database outage.** If the key cannot be checked because the database is down, the response is `503`, not a misleading `401`.
+- **Public endpoints.** `/healthz`, `/readyz` and `/openapi.yaml` need no key.
+
+Keys are managed with `apikey`, which connects as the schema owner through `ADMIN_DATABASE_URL`:
+
+| Command | Effect |
+|---|---|
+| `apikey create NAME` | Registers a client and prints its key. The key is shown once and only its SHA-256 hash is stored. It is the only output on stdout, so `KEY=$(apikey create NAME)` captures it. |
+| `apikey list` | Lists clients: ID, name, key prefix, created and revoked times |
+| `apikey revoke ID` | Revokes the key. The next request using it gets `401`. |
+
+```bash
+# Docker Compose (the image contains the binary)
+docker compose run --rm -T --no-deps --entrypoint /app/apikey migrate create billing-service
+docker compose run --rm -T --no-deps --entrypoint /app/apikey migrate list
+# On the host, with ADMIN_DATABASE_URL set (e.g. from .env)
+go run ./cmd/apikey revoke 0192f3a4-5b6c-7d8e-9f01-23456789abcd
+```
+
+The examples below assume `API_KEY` holds a key, as in [Quick start](#quick-start).
 
 ### Field rules for `POST /trips`
 
@@ -275,6 +329,7 @@ Request bodies must be `Content-Type: application/json`. Every response carries 
 
 ```bash
 curl -i -X POST http://localhost:8080/trips \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"trip_number":"TRIP-1001","source":"Mumbai","destination":"Pune","driver_name":"Ravi Kumar"}'
 ```
@@ -308,7 +363,7 @@ A duplicate trip number returns `409`:
 Missing or blank fields return `400`, with every problem listed:
 
 ```bash
-curl -X POST http://localhost:8080/trips -H 'Content-Type: application/json' \
+curl -X POST http://localhost:8080/trips -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
   -d '{"trip_number":"  ","source":"Mumbai"}'
 ```
 
@@ -330,7 +385,7 @@ curl -X POST http://localhost:8080/trips -H 'Content-Type: application/json' \
 ### Get a trip
 
 ```bash
-curl http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157
 ```
 
 An invalid UUID returns `400 VALIDATION_ERROR` with `{"field":"id","message":"must be a valid UUID"}`. Only the canonical 36-character form is accepted. A well-formed but unknown ID returns `404`:
@@ -350,7 +405,7 @@ An invalid UUID returns `400 VALIDATION_ERROR` with `{"field":"id","message":"mu
 Results are ordered by `created_at DESC, id DESC`, which is newest first and stable even for equal timestamps. Out-of-range values are rejected rather than silently clamped, so client bugs surface. A page past the end returns `"data": []` with correct totals.
 
 ```bash
-curl 'http://localhost:8080/trips?page=1&page_size=20&status=ASSIGNED'
+curl -H "Authorization: Bearer $API_KEY" 'http://localhost:8080/trips?page=1&page_size=20&status=ASSIGNED'
 ```
 
 ```json
@@ -372,7 +427,7 @@ curl 'http://localhost:8080/trips?page=1&page_size=20&status=ASSIGNED'
 ```
 
 ```bash
-curl 'http://localhost:8080/trips?page=0&page_size=500'
+curl -H "Authorization: Bearer $API_KEY" 'http://localhost:8080/trips?page=0&page_size=500'
 ```
 
 ```json
@@ -395,6 +450,7 @@ The count and the page are read in a single `REPEATABLE READ` read-only transact
 
 ```bash
 curl -X PATCH http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157/status \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' -d '{"status":"ASSIGNED"}'
 ```
 
@@ -402,6 +458,7 @@ This returns `200` with the updated trip (`"status":"ASSIGNED"` and a new `updat
 
 ```bash
 curl -X PATCH http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157/status \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' -d '{"status":"COMPLETED"}'
 ```
 
@@ -416,7 +473,7 @@ curl -X PATCH http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157/s
 ### Delete a trip
 
 ```bash
-curl -i -X DELETE http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157
+curl -i -X DELETE -H "Authorization: Bearer $API_KEY" http://localhost:8080/trips/01a16ca2-e784-7927-8432-76a21ee80157
 # HTTP/1.1 204 No Content
 ```
 
@@ -503,6 +560,7 @@ This makes retries of `POST /trips` safe, for example after a timeout where the 
 
 ```bash
 curl -i -X POST http://localhost:8080/trips \
+  -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: 8d5f6a8e-2b1c-4c3e-9f7a-1b2c3d4e5f60' \
   -d '{"trip_number":"TRIP-1001","source":"Mumbai","destination":"Pune","driver_name":"Ravi Kumar"}'
@@ -517,13 +575,14 @@ curl -i -X POST http://localhost:8080/trips \
 | Original request failed (for example a duplicate trip number) | Nothing is remembered; the key can be reused with a corrected body |
 | Key older than `IDEMPOTENCY_TTL` (default `24h`) | Treated as new |
 | Header present but empty, longer than 255, or not printable ASCII | `400 VALIDATION_ERROR` |
+| Same key used by a different client | Independent: each client has its own key space |
 
 **How it works.** The key row is inserted at the start of the same transaction that inserts the trip:
 
 ```sql
-INSERT INTO idempotency_keys (scope, idempotency_key, request_hash, created_at, expires_at)
-VALUES ($1, $2, $3, now(), now() + make_interval(secs => $4))
-ON CONFLICT (scope, idempotency_key) DO UPDATE SET ...   -- reclaim only if expired
+INSERT INTO idempotency_keys (client_id, scope, idempotency_key, request_hash, created_at, expires_at)
+VALUES ($1, $2, $3, $4, now(), now() + make_interval(secs => $5))
+ON CONFLICT (client_id, scope, idempotency_key) DO UPDATE SET ...   -- reclaim only if expired
  WHERE idempotency_keys.expires_at <= now();
 ```
 
@@ -535,7 +594,7 @@ Details:
 
 - **Fingerprint.** The fingerprint is SHA-256 over the normalized input, so JSON key order and surrounding whitespace do not make two semantically equal requests "different".
 - **Snapshot replay.** The replay returns the trip as it was when created, even if it has since changed status or been deleted. This matches the semantics of a retried request.
-- **Scope.** Keys are scoped to the operation (`POST /trips`). With authentication, the scope would also include the client or tenant ID; see limitations.
+- **Scope.** Keys are unique per authenticated client and operation, through the primary key `(client_id, scope, idempotency_key)`. Two clients can use the same key without colliding, and neither can obtain the other's result through it (`TestIdempotencyKeysAreScopedPerClient`).
 
 Tests: `tests/idempotency_test.go`. They cover replay, key reuse with a different body, keys not consumed by failed requests, expiry, and two concurrency tests: 25 simultaneous identical requests produce one trip and 24 replays, and racing two different bodies under one key produces exactly one winner.
 
@@ -562,6 +621,7 @@ Every error uses one envelope:
 | 400 | `VALIDATION_ERROR` | Missing, blank, too long or invalid fields; invalid UUID; bad `page`/`page_size`; bad `Idempotency-Key` |
 | 400 | `INVALID_JSON` | Malformed JSON; empty or non-object body (including `null`); unknown, case-variant or duplicate field; wrong type; multiple JSON values |
 | 400 | `INVALID_STATUS` | Status value that is not one of the five statuses |
+| 401 | `UNAUTHENTICATED` | Missing, malformed, unknown or revoked API key on a `/trips` route (with `WWW-Authenticate: Bearer`) |
 | 404 | `TRIP_NOT_FOUND` | No trip with this ID |
 | 404 | `ROUTE_NOT_FOUND` | Unknown path |
 | 405 | `METHOD_NOT_ALLOWED` | Known path, wrong method |
@@ -609,7 +669,7 @@ Other variables:
 
 | Variable | Used by | Description |
 |---|---|---|
-| `ADMIN_DATABASE_URL` | `migrate` | Owner-role URL; required |
+| `ADMIN_DATABASE_URL` | `migrate`, `apikey` | Owner-role URL; required |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Compose | Owner credentials and database name |
 | `API_DB_PASSWORD` | Compose | Password given to `trip_api` when the volume is first created (default `trip_api`) |
 | `POSTGRES_PORT`, `API_PORT` | Compose | Host ports (defaults `5432`, `8080`) |
@@ -649,6 +709,8 @@ cp .env.example .env     # optional; defaults work without it
 make docker-up           # docker compose up -d --build --wait
 make docker-logs         # docker compose logs -f api
 make docker-down         # docker compose down
+make api-key NAME=my-app # create an API key (printed once)
+make api-keys            # list API clients
 ```
 
 | Service | Role | Health |
@@ -685,8 +747,9 @@ The Makefile loads `.env` automatically. Without `make`, export the variables fr
 | Domain unit tests | `internal/domain` | no | All 25 transition pairs, terminal states, status parsing, field validation and length limits (in characters), trimming, fingerprints, idempotency-key rules |
 | Handler unit tests | `internal/handler` | no | Malformed, empty, unknown-field, wrong-type and oversized bodies; wrong content type; invalid UUID forms; pagination defaults, bounds and invalid values; error-to-HTTP mapping; panic recovery without leaks; request-ID propagation; readiness while draining |
 | Config unit tests | `internal/config` | no | Defaults, aggregated errors, timeout invariants |
+| Auth unit tests | `internal/auth`, `internal/middleware` | no | Key format and hashing, bearer parsing, every accept/reject path of the middleware, `client_id` in access logs |
 | Repository unit tests | `internal/repository` | no | Driver-to-domain error mapping: constraint names, connection-loss and timeout classes, client cancellation |
-| Integration tests | `tests/` | **yes** | Every endpoint end to end through the real router, service, repository and PostgreSQL, plus DB constraints, concurrency and idempotency |
+| Integration tests | `tests/` | **yes** | Every endpoint end to end through the real router, service, repository and PostgreSQL, plus DB constraints, concurrency, idempotency, authentication and revocation, per-client idempotency, and the privileges of the API's database role |
 
 Run the tests:
 
@@ -730,6 +793,11 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 **In place:**
 
 - **SQL injection:** every query is a fixed string with bind parameters. Even the status filter selects between two constant statements rather than building SQL.
+- **Authentication:** every `/trips` route requires a per-client API key.
+  - Keys have 256 bits of entropy and are stored only as SHA-256 hashes, so a database leak reveals no usable key.
+  - Revocation is effective on the next request.
+  - Malformed keys are rejected before any database lookup.
+  - Access logs record the `client_id`, never the key.
 - **Least-privilege database access:** the API connects as `trip_api`, which can only read and write rows; see [Database roles](#database-roles).
 - **Information leakage:** errors are sanitized to stable codes. Panics return a generic `500`, and their stack traces go to logs only.
 - **Abuse limits:** request body cap (`413`), `MaxHeaderBytes` of 16 KiB, read-header, read, write and idle timeouts, a per-request context deadline, and a bounded DB pool.
@@ -752,7 +820,7 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 
 **Required before real production use:**
 
-- Authentication and authorization.
+- Authorization: per-client permissions or tenant isolation, if clients should not all have full access.
 - Rate limiting.
 - TLS to the database (`sslmode=verify-full`); the `sslmode=disable` in `.env.example` is for local use only.
 - Secrets from a secret manager.
@@ -773,11 +841,14 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 | Idempotency snapshot replay | The retried request gets exactly the original response. | Snapshot can be stale relative to the current trip. That is intended, and documented. |
 | Separate migrate step | Safe with many replicas; failures are visible. | One more deployment step (automated in Compose). |
 | Physical delete, any status | Matches the brief, simple semantics. | No audit trail. |
-| A single interface (`handler.TripService`) | Handler tests need a fake. Nothing else does. | The service is tested via integration tests rather than mocks. |
+| API keys rather than JWT | Fits service-to-service clients; needs no identity provider; revocation is immediate. | One indexed lookup per request, and key distribution is manual (`apikey create`). |
+| SHA-256 for key hashes, not bcrypt | Keys are 256-bit random, so there is nothing to brute-force, and a slow hash on every request would only add latency. | Not suitable for human passwords (none are stored). |
+| Two small interfaces (`handler.TripService`, `auth.ClientStore`) | Handler and middleware tests need fakes. Nothing else does. | The service is tested via integration tests rather than mocks. |
 
 ## Known limitations and future work
 
-- **No authentication or authorization.** Idempotency scope would then include the client ID.
+- **Authentication without authorization.** Every valid key has full access to all trips. There are no per-client permissions, scopes or tenant isolation.
+- **One database lookup per authenticated request** (a unique-index hit) keeps revocation immediate. A short in-process cache would remove it, at the cost of a revocation delay.
 - **Expired idempotency keys are reclaimed on reuse but not purged.** Add a scheduled `DELETE FROM idempotency_keys WHERE expires_at < now()` (indexed).
 - **`total_items` uses `count(*)`,** which is linear in the number of matching rows. For very large tables, consider estimates or keyset pagination with "has more".
 - **No status history.** A `trip_status_events` table written in the same transaction would provide an audit trail. Combined with soft deletion (`deleted_at`), it would make deletion of `IN_TRANSIT` trips reviewable.
