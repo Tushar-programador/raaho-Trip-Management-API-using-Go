@@ -1,4 +1,6 @@
-// Command migrate applies the embedded schema migrations to DATABASE_URL.
+// Command migrate applies the embedded schema migrations to
+// ADMIN_DATABASE_URL, which must connect as the schema owner (the API's own
+// least-privilege role cannot run DDL).
 //
 // Usage:
 //
@@ -38,9 +40,9 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: migrate up|down|version|force VERSION")
 	}
-	url := os.Getenv("DATABASE_URL")
+	url := os.Getenv("ADMIN_DATABASE_URL")
 	if url == "" {
-		return errors.New("DATABASE_URL is required")
+		return errors.New("ADMIN_DATABASE_URL is required (the schema owner, not the API role)")
 	}
 
 	log := logger.New(os.Stdout, "text", 0)

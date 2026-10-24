@@ -115,6 +115,21 @@ func CheckSchema(ctx context.Context, pool *pgxpool.Pool, want uint) error {
 	return nil
 }
 
+// IsPrivilegedRole reports whether the connected role can change the schema:
+// it is a superuser, owns the trips table, or is a member of the owner role.
+// The API only needs row access, so a true result means it is running with
+// far more privilege than necessary.
+func IsPrivilegedRole(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	var privileged bool
+	err := pool.QueryRow(ctx,
+		`SELECT pg_has_role(current_user, relowner, 'MEMBER') FROM pg_class WHERE oid = 'public.trips'::regclass`,
+	).Scan(&privileged)
+	if err != nil {
+		return false, fmt.Errorf("database: check role privileges: %w", err)
+	}
+	return privileged, nil
+}
+
 // NewMigrator builds a golang-migrate instance that applies the migrations in
 // fsys over an existing pool. golang-migrate takes a PostgreSQL advisory lock,
 // so concurrent runs cannot apply the same migration twice.

@@ -79,7 +79,7 @@ curl http://localhost:8080/readyz
 
 `docker-up` starts PostgreSQL, waits for it to be healthy, runs the migrations once in a separate container, and only then starts the API. The command returns when the API's health check passes.
 
-If port 5432 or 8080 is already in use, set `POSTGRES_PORT` and `API_PORT` in `.env`. If you change `POSTGRES_PORT`, also update the port in `DATABASE_URL` and `TEST_DATABASE_URL`; the host-side commands (`make run`, `make migrate-up`, `make test-integration`) use those URLs.
+If port 5432 or 8080 is already in use, set `POSTGRES_PORT` and `API_PORT` in `.env`. If you change `POSTGRES_PORT`, also update the port in the four `*DATABASE_URL` variables; the host-side commands (`make run`, `make migrate-up`, `make test-integration`) use those URLs.
 
 Stop with `make docker-down` (or `docker compose down`). Add `-v` to `docker compose down` to also delete the database volume.
 
@@ -133,7 +133,7 @@ There is exactly one interface: `handler.TripService`, declared at the consumer 
 ├── cmd/
 │   ├── api/main.go             # HTTP server (+ `api healthcheck` probe)
 │   └── migrate/main.go         # migration CLI: up | down | version | force N
-├── deploy/postgres/init/       # creates the trips_test database on first start
+├── deploy/postgres/init/       # first start: trips_test database, trip_api login role
 ├── internal/
 │   ├── config/                 # env-based config with validation
 │   ├── domain/                 # Trip, Status, transitions, validation, errors
@@ -194,6 +194,22 @@ Both list queries were checked with `EXPLAIN` on 50,000 seeded rows. Each uses a
 A `CHECK` constraint ensures a key row either has a complete result or none. An index on `expires_at` supports purging expired keys.
 
 Timestamps are `TIMESTAMPTZ`, written by PostgreSQL and always returned in UTC (`2026-10-24T06:39:37.86131Z`).
+
+### Database roles
+
+The API never connects as the schema owner.
+
+| Role | Used by | Can do |
+|---|---|---|
+| Owner (`POSTGRES_USER`, via `ADMIN_DATABASE_URL`) | `migrate` | Everything: DDL, migrations |
+| `trip_api` (via `DATABASE_URL`) | The API | `SELECT/INSERT/UPDATE/DELETE` on `trips` and `idempotency_keys`; `SELECT` on `schema_migrations`. No `ALTER`, `DROP`, `TRUNCATE` or `CREATE`. |
+
+A bug or SQL injection in the API therefore cannot alter or destroy the schema, or rewrite the migration history.
+
+- **Grants are in migrations** (`000003_grant_api_role`). Each later table grants `trip_api` exactly what it needs, so privileges are reviewed together with the schema change.
+- **The credential is not.** In Compose, `deploy/postgres/init/02-create-api-role.sh` creates `trip_api` with `LOGIN` and `API_DB_PASSWORD` when the volume is first initialised. Elsewhere, the migration creates the role as `NOLOGIN` if it is missing, and an operator enables it with `ALTER ROLE trip_api LOGIN PASSWORD '...'`.
+- **The API checks its own privileges at startup.** If it is connected as a superuser or the table owner, it logs a warning.
+- **Tests enforce this.** `TestAPIRoleCannotChangeSchema` asserts that every DDL statement is refused with `42501`. The rest of the integration suite runs through the API on this role.
 
 ---
 
@@ -571,7 +587,7 @@ All configuration comes from environment variables. The values are validated at 
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | **required** | PostgreSQL URL, e.g. `postgres://user:pass@host:5432/db?sslmode=disable` |
+| `DATABASE_URL` | **required** | PostgreSQL URL for the API, as the least-privilege `trip_api` role, e.g. `postgres://trip_api:pass@host:5432/db?sslmode=disable` |
 | `HTTP_ADDR` | `:8080` | Listen address |
 | `LOG_FORMAT` | `json` | `json` or `text` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -589,7 +605,16 @@ All configuration comes from environment variables. The values are validated at 
 | `DB_LOCK_TIMEOUT` | `2s` | PostgreSQL `lock_timeout` per connection (`503` when exceeded); must not exceed `DB_STATEMENT_TIMEOUT` |
 | `IDEMPOTENCY_TTL` | `24h` | How long an `Idempotency-Key` is remembered |
 
-Compose-only variables (from `.env`): `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT` (host port, default `5432`), `API_PORT` (host port, default `8080`). The integration tests read `TEST_DATABASE_URL`.
+Other variables:
+
+| Variable | Used by | Description |
+|---|---|---|
+| `ADMIN_DATABASE_URL` | `migrate` | Owner-role URL; required |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Compose | Owner credentials and database name |
+| `API_DB_PASSWORD` | Compose | Password given to `trip_api` when the volume is first created (default `trip_api`) |
+| `POSTGRES_PORT`, `API_PORT` | Compose | Host ports (defaults `5432`, `8080`) |
+| `TEST_DATABASE_URL` | Integration tests | Owner URL for a dedicated test database |
+| `TEST_APP_DATABASE_URL` | Integration tests | Optional `trip_api` URL; when set, the API under test runs as that role |
 
 ## Database migrations
 
@@ -602,7 +627,9 @@ Migrations are plain, versioned SQL files in `migrations/`. They are embedded in
 | `go run ./cmd/migrate version` | `make migrate-version` | Show current version and dirty flag |
 | `go run ./cmd/migrate force N` | | Mark version `N` clean after fixing a failed migration |
 
-All of them use `DATABASE_URL`.
+All of them connect with `ADMIN_DATABASE_URL`, the schema owner. The API's own role cannot run DDL.
+
+> **Upgrading an existing local volume:** `trip_api` is created by the init script, which only runs on a fresh volume. If your volume predates the role, either recreate it with `docker compose down -v`, which deletes the data, or run `ALTER ROLE trip_api LOGIN PASSWORD 'trip_api'` as the owner after migrating.
 
 **Order of operations:** migrate first, then start the API.
 
@@ -641,9 +668,9 @@ The image is a multi-stage build: `golang:1.26-alpine` compiles static binaries,
 ## Running on the host
 
 ```bash
-cp .env.example .env     # DATABASE_URL points at localhost:5432
+cp .env.example .env     # DATABASE_URL (trip_api) and ADMIN_DATABASE_URL (owner) point at localhost:5432
 make db-up               # docker compose up -d --wait postgres
-make migrate-up          # go run ./cmd/migrate up
+make migrate-up          # go run ./cmd/migrate up  (as the owner)
 make run                 # go run ./cmd/api
 ```
 
@@ -677,6 +704,8 @@ make lint                      # gofmt check + go vet
 
 > ⚠️ The integration tests **truncate** `trips` and `idempotency_keys`. `TEST_DATABASE_URL` must point at a dedicated database. Compose creates `trips_test` for this purpose on first start.
 
+With `TEST_APP_DATABASE_URL` set (as in `.env.example` and `make test-race-docker`), the API under test connects as `trip_api`, so the suite proves the restricted role is sufficient. The owner connection is used only for migrations, truncation and assertions.
+
 `make test-race-docker` exists because the race detector needs cgo. It gives the same `-race` coverage on machines without a C toolchain, such as Windows without MinGW.
 
 ## OpenAPI documentation
@@ -701,6 +730,7 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 **In place:**
 
 - **SQL injection:** every query is a fixed string with bind parameters. Even the status filter selects between two constant statements rather than building SQL.
+- **Least-privilege database access:** the API connects as `trip_api`, which can only read and write rows; see [Database roles](#database-roles).
 - **Information leakage:** errors are sanitized to stable codes. Panics return a generic `500`, and their stack traces go to logs only.
 - **Abuse limits:** request body cap (`413`), `MaxHeaderBytes` of 16 KiB, read-header, read, write and idle timeouts, a per-request context deadline, and a bounded DB pool.
 - **Log hygiene:** access logs record method, path, route, status, size and duration. They never record bodies, headers or query strings, so no personal data or secrets end up in logs. `DATABASE_URL` parse errors are not echoed, because they could contain the password. Inbound `X-Request-ID` values are restricted to `[A-Za-z0-9._-]{1,128}` to prevent header and log injection.

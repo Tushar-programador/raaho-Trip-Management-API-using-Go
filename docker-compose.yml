@@ -3,8 +3,13 @@ name: trip-management
 # Startup order: postgres (healthy) -> migrate (exits 0) -> api (healthy).
 # Migrations run exactly once per `up` in their own container; API replicas
 # never migrate, and refuse to start if the schema is behind.
+#
+# Two database roles:
+#   - the owner (POSTGRES_USER) runs migrations and API-key administration;
+#   - trip_api is what the API connects as: row access only, no DDL.
 
-x-database-url: &database-url postgres://${POSTGRES_USER:-trips}:${POSTGRES_PASSWORD:-trips}@postgres:5432/${POSTGRES_DB:-trips}?sslmode=disable
+x-admin-database-url: &admin-database-url postgres://${POSTGRES_USER:-trips}:${POSTGRES_PASSWORD:-trips}@postgres:5432/${POSTGRES_DB:-trips}?sslmode=disable
+x-api-database-url: &api-database-url postgres://trip_api:${API_DB_PASSWORD:-trip_api}@postgres:5432/${POSTGRES_DB:-trips}?sslmode=disable
 
 services:
   postgres:
@@ -13,11 +18,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-trips}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trips}
       POSTGRES_DB: ${POSTGRES_DB:-trips}
+      # Read by deploy/postgres/init/02-create-api-role.sh.
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-trip_api}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Creates the trips_test database used by the integration tests (first start only).
+      # First start only: creates the trips_test database and the trip_api login role.
       - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
@@ -32,7 +39,7 @@ services:
     entrypoint: ["/app/migrate"]
     command: ["up"]
     environment:
-      DATABASE_URL: *database-url
+      ADMIN_DATABASE_URL: *admin-database-url
     depends_on:
       postgres:
         condition: service_healthy
@@ -42,7 +49,7 @@ services:
     build: .
     image: trip-management-api:local
     environment:
-      DATABASE_URL: *database-url
+      DATABASE_URL: *api-database-url
       HTTP_ADDR: ":8080"
       # Fixed rather than read from .env, where LOG_FORMAT=text is meant for `make run`.
       LOG_FORMAT: json

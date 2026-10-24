@@ -1,10 +1,14 @@
 // Package tests contains HTTP integration tests that run the real router,
 // service and repository against a real PostgreSQL database.
 //
-// They require TEST_DATABASE_URL and are skipped without it. The database is
-// migrated and then TRUNCATED between tests, so never point it at real data:
+// They require TEST_DATABASE_URL (the schema owner) and are skipped without
+// it. The database is migrated and then TRUNCATED between tests, so never
+// point it at real data. When TEST_APP_DATABASE_URL is also set, the API under
+// test connects as that (least-privilege) role, exactly as in production:
 //
-//	TEST_DATABASE_URL=postgres://trips:trips@localhost:5432/trips_test?sslmode=disable go test ./tests/...
+//	TEST_DATABASE_URL=postgres://trips:trips@localhost:5432/trips_test?sslmode=disable \
+//	TEST_APP_DATABASE_URL=postgres://trip_api:trip_api@localhost:5432/trips_test?sslmode=disable \
+//	go test ./tests/...
 package tests
 
 import (
@@ -35,7 +39,8 @@ import (
 const lockTimeout = 2 * time.Second
 
 var (
-	pool    *pgxpool.Pool // direct database access for assertions
+	pool    *pgxpool.Pool // owner role: truncation and direct assertions
+	appPool *pgxpool.Pool // the API's connection; nil when TEST_APP_DATABASE_URL is unset
 	baseURL string        // the API under test
 	client  = &http.Client{Timeout: 30 * time.Second}
 )
@@ -58,24 +63,38 @@ func runWithDatabase(m *testing.M, url string) int {
 		return 1
 	}
 
-	var err error
 	// Enough connections that concurrent requests really contend inside
-	// PostgreSQL instead of queueing for a pool slot.
-	// A short lock timeout keeps TestStatusUpdateLockTimeout fast; it is still
-	// far longer than any lock wait in the other tests.
-	pool, err = database.Connect(ctx, url, database.PoolOptions{
+	// PostgreSQL instead of queueing for a pool slot. A short lock timeout
+	// keeps TestStatusUpdateLockTimeout fast; it is still far longer than any
+	// lock wait in the other tests.
+	opts := database.PoolOptions{
 		MaxConns:         32,
 		ConnectTimeout:   15 * time.Second,
 		StatementTimeout: 10 * time.Second,
 		LockTimeout:      lockTimeout,
-	}, log)
+	}
+	var err error
+	pool, err = database.Connect(ctx, url, opts, log)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "connect:", err)
 		return 1
 	}
 	defer pool.Close()
 
-	svc := service.NewTripService(repository.NewTripRepository(pool), time.Hour)
+	apiPool := pool
+	if appURL := os.Getenv("TEST_APP_DATABASE_URL"); appURL != "" {
+		appPool, err = database.Connect(ctx, appURL, opts, log)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "connect as API role:", err)
+			return 1
+		}
+		defer appPool.Close()
+		apiPool = appPool
+	} else {
+		fmt.Println("TEST_APP_DATABASE_URL not set: the API under test connects as the owner role")
+	}
+
+	svc := service.NewTripService(repository.NewTripRepository(apiPool), time.Hour)
 	srv := httptest.NewServer(handler.NewRouter(svc, log, handler.RouterOptions{
 		RequestTimeout: 20 * time.Second,
 		MaxBodyBytes:   64 << 10,

@@ -68,6 +68,12 @@ func run() error {
 	if err := database.CheckSchema(ctx, pool, want); err != nil {
 		return err
 	}
+	if privileged, err := database.IsPrivilegedRole(ctx, pool); err != nil {
+		return err
+	} else if privileged {
+		log.Warn("the API is connected as a role that can alter or drop the schema; " +
+			"connect it as the least-privilege trip_api role (see README, Database roles)")
+	}
 
 	var draining atomic.Bool
 	svc := service.NewTripService(repository.NewTripRepository(pool), cfg.IdempotencyTTL)

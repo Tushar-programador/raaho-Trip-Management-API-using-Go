@@ -7,8 +7,10 @@ COMPOSE ?= docker compose
 
 POSTGRES_USER     ?= trips
 POSTGRES_PASSWORD ?= trips
+API_DB_PASSWORD   ?= trip_api
 # Inside the compose network the database is always postgres:5432.
-DOCKER_TEST_DATABASE_URL = postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/trips_test?sslmode=disable
+DOCKER_TEST_DATABASE_URL     = postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/trips_test?sslmode=disable
+DOCKER_TEST_APP_DATABASE_URL = postgres://trip_api:$(API_DB_PASSWORD)@postgres:5432/trips_test?sslmode=disable
 
 .DEFAULT_GOAL := help
 .PHONY: help run build test test-unit test-integration test-race test-race-docker \
@@ -41,6 +43,7 @@ test-race-docker: db-up ## Run all tests with -race inside a golang container ag
 	docker run --rm --network trip-management_default \
 		-v "$(CURDIR)":/src -w /src -v trip-management-gomod:/go/pkg/mod \
 		-e TEST_DATABASE_URL="$(DOCKER_TEST_DATABASE_URL)" \
+		-e TEST_APP_DATABASE_URL="$(DOCKER_TEST_APP_DATABASE_URL)" \
 		golang:1.26 go test -race -count=1 ./...
 
 lint: ## Check formatting and run go vet
@@ -50,13 +53,13 @@ lint: ## Check formatting and run go vet
 fmt: ## Format all Go files
 	gofmt -w .
 
-migrate-up: ## Apply all pending migrations to DATABASE_URL
+migrate-up: ## Apply all pending migrations (as ADMIN_DATABASE_URL)
 	$(GO) run ./cmd/migrate up
 
-migrate-down: ## Roll back the most recent migration on DATABASE_URL
+migrate-down: ## Roll back the most recent migration (as ADMIN_DATABASE_URL)
 	$(GO) run ./cmd/migrate down
 
-migrate-version: ## Print the schema version of DATABASE_URL
+migrate-version: ## Print the schema version (via ADMIN_DATABASE_URL)
 	$(GO) run ./cmd/migrate version
 
 db-up: ## Start only PostgreSQL (and wait until it is healthy)
