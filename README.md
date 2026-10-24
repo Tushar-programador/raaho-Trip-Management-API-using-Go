@@ -27,6 +27,7 @@ The interesting part is not the CRUD. It is that **business rules hold under con
 - [OpenAPI documentation](#openapi-documentation)
 - [Security and production readiness](#security-and-production-readiness)
 - [Design decisions and trade-offs](#design-decisions-and-trade-offs)
+- [Audit history (planned)](#audit-history-planned)
 - [Known limitations and future work](#known-limitations-and-future-work)
 
 ---
@@ -840,10 +841,38 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 | Trim whitespace | `" T-1 "` and `"T-1"` should not be two trips. | Values are not stored byte-for-byte as sent. |
 | Idempotency snapshot replay | The retried request gets exactly the original response. | Snapshot can be stale relative to the current trip. That is intended, and documented. |
 | Separate migrate step | Safe with many replicas; failures are visible. | One more deployment step (automated in Compose). |
-| Physical delete, any status | Matches the brief, simple semantics. | No audit trail. |
+| Physical delete, any status | Matches the brief, simple semantics. | No audit trail yet; see [Audit history (planned)](#audit-history-planned). |
 | API keys rather than JWT | Fits service-to-service clients; needs no identity provider; revocation is immediate. | One indexed lookup per request, and key distribution is manual (`apikey create`). |
 | SHA-256 for key hashes, not bcrypt | Keys are 256-bit random, so there is nothing to brute-force, and a slow hash on every request would only add latency. | Not suitable for human passwords (none are stored). |
 | Two small interfaces (`handler.TripService`, `auth.ClientStore`) | Handler and middleware tests need fakes. Nothing else does. | The service is tested via integration tests rather than mocks. |
+
+## Audit history (planned)
+
+> **Current status:** audit history is a planned improvement. It is **not implemented** in the current version.
+
+Because of the assignment's time constraints, the current implementation prioritizes core trip management and safe status transitions. A trip stores only its current `status` and `updated_at`, so earlier states, and who changed them, are not recorded.
+
+For a production logistics system, a dedicated `trip_status_history` table would improve traceability and debugging:
+
+| Column | Records |
+|---|---|
+| `trip_id` | The trip that changed |
+| `previous_status` | Status before the change |
+| `new_status` | Status after the change |
+| `changed_at` | Timestamp of the change |
+| `changed_by` | The user or system responsible, such as the authenticated API client's `client_id`, which every request already carries |
+
+**Consistency:** the status update and its history record must be written in the same database transaction. In this codebase that means inserting the history row inside `TripRepository.UpdateStatus`, after the `UPDATE` and before `COMMIT`, while the row lock is still held. That gives two guarantees:
+
+- Either both the change and its record are saved, or neither is.
+- Concurrent updates are already serialized by the lock, so history order matches the order in which changes were applied.
+
+How it would fit the existing design:
+
+- **Privileges.** Following [Database roles](#database-roles), its migration would grant `trip_api` only `INSERT` and `SELECT` on the table. The API could then append history but never rewrite it.
+- **Deleted trips.** Trips are physically deleted today, so history rows must not cascade away with their trip. Pairing this with soft deletion (`deleted_at`) would keep deleted trips reviewable.
+
+This enhancement can be implemented in a future iteration, alongside trip history retrieval (for example `GET /trips/{id}/history`) and audit reporting.
 
 ## Known limitations and future work
 
@@ -851,7 +880,7 @@ docker run --rm -p 8081:8080 -e SWAGGER_JSON=/spec/openapi.yaml -v "$PWD/api:/sp
 - **One database lookup per authenticated request** (a unique-index hit) keeps revocation immediate. A short in-process cache would remove it, at the cost of a revocation delay.
 - **Expired idempotency keys are reclaimed on reuse but not purged.** Add a scheduled `DELETE FROM idempotency_keys WHERE expires_at < now()` (indexed).
 - **`total_items` uses `count(*)`,** which is linear in the number of matching rows. For very large tables, consider estimates or keyset pagination with "has more".
-- **No status history.** A `trip_status_events` table written in the same transaction would provide an audit trail. Combined with soft deletion (`deleted_at`), it would make deletion of `IN_TRANSIT` trips reviewable.
+- **No audit history of status changes.** This is planned; see [Audit history (planned)](#audit-history-planned).
 - **No optimistic concurrency for clients** (`ETag` / `If-Match`) to detect lost updates across read-modify-write cycles on the client side.
 - **No metrics or tracing endpoints.**
 - **The integration tests share one database** and are not run in parallel with each other.
