@@ -106,6 +106,11 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	if cfg.DBMaxConns < 1 {
 		p.fail("DB_MAX_CONNS must be at least 1")
 	}
+	// PostgreSQL intervals have microsecond precision; a sub-microsecond TTL
+	// would round to zero and violate expires_at > created_at on every keyed POST.
+	if cfg.IdempotencyTTL < time.Second {
+		p.fail("IDEMPOTENCY_TTL must be at least 1s")
+	}
 
 	if len(p.errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(p.errs...))

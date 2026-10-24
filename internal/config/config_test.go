@@ -67,6 +67,15 @@ func TestShutdownDrainDelay(t *testing.T) {
 	}
 }
 
+func TestIdempotencyTTLMinimum(t *testing.T) {
+	for ttl, wantErr := range map[string]bool{"500ns": true, "999ms": true, "1s": false, "24h": false} {
+		_, err := LoadFrom(env(map[string]string{"DATABASE_URL": "postgres://localhost/db", "IDEMPOTENCY_TTL": ttl}))
+		if gotErr := err != nil && strings.Contains(err.Error(), "IDEMPOTENCY_TTL"); gotErr != wantErr {
+			t.Errorf("IDEMPOTENCY_TTL=%s: error = %v, want error %v", ttl, err, wantErr)
+		}
+	}
+}
+
 func TestRequestTimeoutMustBeBelowWriteTimeout(t *testing.T) {
 	_, err := LoadFrom(env(map[string]string{
 		"DATABASE_URL":       "postgres://localhost/db",
